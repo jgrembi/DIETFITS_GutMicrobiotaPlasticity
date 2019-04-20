@@ -5,3 +5,4 @@ This github project contains the analysis files for the DIETFITS gut microbiota 
 
 The files include:
 
+- \texttt{dada2_pipeline.R}
