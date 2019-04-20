@@ -1,0 +1,878 @@
+---
+title: "Ordination Lan"
+author: "Lan Huong Nguyen"
+date: "9/7/2018"
+output: 
+  BiocStyle::html_document:
+    toc_float: true
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+rm(list = ls())
+knitr::opts_chunk$set(
+  echo = TRUE, warning = FALSE, message = FALSE, 
+  fig.path = "../figs/ordination/", dev=c('png', 'pdf'),
+  fig.align = 'center', fig.wide = TRUE, 
+  fig.width = 8, fig.height = 6
+)
+```
+
+# Set up
+
+```{r}
+.packages <- c("gridExtra","RColorBrewer", "viridis", "phyloseq", "tidyverse")
+sapply(.packages, require, character.only = TRUE)
+
+options(stringsAsFactors = FALSE)
+theme_set(theme_bw())
+theme_update(
+  text = element_text(size = 20),
+  strip.background = element_rect(fill = "grey95"))
+```
+
+```{r}
+collapse_samples <- function(physeq, sample_id = "SampleID", fun = mean){
+  sampledata_collapsed <- sample_data(physeq) %>%
+    select(-Lane, -MeasID, -OrigSampleDepth) %>%
+    distinct() 
+  rownames(sampledata_collapsed) <- sampledata_collapsed[[sample_id]]
+  seqtab <- data.frame(as(otu_table(physeq), "matrix"))
+  if(!taxa_are_rows(physeq)) seqtab <- t(seqtab)
+  
+  sample_ids <- physeq@sam_data[[sample_id]]
+  seqtab_collapsed <- sapply(unique(sample_ids), function(id){ 
+    if(sum(sample_ids == id) == 1) return(seqtab[, sample_ids == id])
+    apply(seqtab[, sample_ids == id], 1, fun)
+  })
+  rownames(seqtab_collapsed) <- rownames(seqtab)
+  physeq_collapsed <- phyloseq(
+    otu_table(seqtab_collapsed, taxa_are_rows = TRUE),
+    sample_data(sampledata_collapsed), 
+    tax_table(physeq), phy_tree(physeq))
+  return(physeq_collapsed)
+}
+
+
+get_scores <- function(pcoa_out, smp_data, axes = 1:2){
+  scores <- pcoa_out$vectors[, axes]
+  colnames(scores) <- paste0("PC", axes)
+  # Combine sample scores and sample data
+  sample_scores <- data.frame(scores, stringsAsFactors = FALSE) %>%
+    rownames_to_column("SampleID") %>%
+    left_join(smp_data) %>%
+    mutate(
+      SubjectID_Timepoint = factor(paste0(SubjectID, "_", Timepoint)),
+      Timepoint = factor(Timepoint, levels = c("Baseline", "10 Week"))
+    )
+  return(sample_scores)
+}
+
+get_evals <- function(pcoa_out) {
+  evals <- pcoa_out$values[,1]
+  var_exp <- 100 * evals/sum(evals)
+  return(list("evals" = evals, "variance_exp" = var_exp))
+}
+
+
+plot_ordination <- function(
+  sample_scores, var_exp, group_column = "SubjectID_Timepoint", 
+  color_continuous = FALSE, color_column = NULL, colors = NULL, shape = 21, 
+  ax_names = c("PC1", "PC2")){
+  if(is.null(color_column)){
+    color_column <- "Color_Column"
+    sample_scores$Color_Column <- "Color"
+  }
+  if(is.null(colors)){
+    nCols <-length(unique(sample_scores[[color_column]]))
+    colors <- RColorBrewer::brewer.pal(9, "Set1")
+    colors <- colorRampPalette(colors)(nCols)
+  }
+  plt <- ggplot(
+    sample_scores, 
+    aes_string(
+      x = ax_names[1], y = ax_names[2], fill = color_column)) +
+    geom_polygon(aes_string(group = group_column)) +
+    geom_path(aes_string(group = group_column, color = color_column)) +
+    geom_point(size = 3, color = "grey10", shape = shape) +
+    xlab(sprintf("PC1 [%s%% variance]", round(var_exp[1], 2))) +
+    ylab(sprintf("PC2 [%s%% variance]", round(var_exp[2], 2))) +
+    coord_fixed() +
+    theme(text = element_text(size = 20)) 
+  if (!color_continuous){ # if continuous
+    plt <- plt + scale_fill_manual(values = colors, na.value = "grey") +
+    scale_color_manual(values = colors, na.value = "grey") 
+  }
+  return(plt)
+}
+```
+
+# Load data
+
+```{r}
+(ps0 <- readRDS("../data/phyloseq/diet_participants_tipglom_with_adherence.rds"))
+```
+
+## Filter out samples
+
+```{r}
+minSampleDepth <- 10000
+(ps0 <- subset_samples(ps0, sample_sums(ps0) > minSampleDepth))
+# Outlier samples:
+(ps0 <- subset_samples(ps0, !(SubjectID == "1139" & Timepoint == "10 Week")))
+(ps0 <- subset_samples(ps0, !is.na(Cohort)))
+(ps0 <- subset_samples(ps0, !is.na(Cat.12Mo)))
+(ps0 <- subset_taxa(ps0, taxa_sums(ps0) > 0))
+
+sample_data(ps0)$Subj_Group <- 
+  factor(paste0(sample_data(ps0)$SubjectID, "_", sample_data(ps0)$Timepoint))
+```
+
+## Data Stats
+
+```{r}
+table(ps0@sam_data$Cohort)
+```
+
+```{r}
+summary(sample_sums(subset_samples(ps0, Cohort == 2)))
+summary(sample_sums(subset_samples(ps0, Cohort == 3)))
+```
+
+
+```{r}
+SUBJ <- sample_data(ps0) %>%
+  data.frame() %>%
+  select(SubjectID, Cat.12Mo, Cohort, Diet, Gender, Timepoint,
+         Weight_kg.BL, Age, Percent.12Mo) %>%
+  distinct() 
+
+df <- SUBJ %>%
+  group_by(Cohort, Diet, Timepoint) %>%
+  summarise(Count = n()) %>%
+  arrange(Cohort,Timepoint, Diet)
+df
+```
+
+```{r}
+df <- SUBJ %>%
+  group_by(Cohort, Diet, Timepoint, Gender) %>%
+  summarise(Count = n()) %>%
+  arrange(Cohort,Timepoint, Diet, Gender)
+df
+```
+
+```{r}
+SUBJ <- sample_data(ps0) %>%
+  filter(Timepoint == "Baseline") %>%
+  data.frame() %>%
+  select(SubjectID, Cat.12Mo, Cohort, Diet, Gender, 
+         Weight_kg.BL, Age, Percent.12Mo) %>%
+  distinct() 
+
+SUBJ %>%
+  group_by(Cohort, Diet) %>%
+  summarise(count = n())
+```
+
+```{r}
+SUBJ %>%
+  group_by(Cohort, Diet, Gender) %>%
+  summarise(count = n())
+```
+
+```{r}
+SUBJ <- sample_data(ps0) %>%
+  filter(Timepoint == "Baseline") %>%
+  data.frame() %>%
+  select(SubjectID, Cat.12Mo, Cohort, Diet, Gender, 
+         Weight_kg.BL, Weight_kg.12Mo, Age, Percent.12Mo) %>%
+  distinct() 
+
+SUBJ %>% 
+  group_by(Cohort, Diet) %>%
+  summarise(
+    m_age = mean(Age), sd_age = sd(Age),
+    m_weight = mean(Weight_kg.BL), sd_wBL = sd(Weight_kg.BL), 
+    m_w12Mo = mean(Weight_kg.12Mo), sd_w12Mo = sd(Weight_kg.12Mo), 
+    m_ploss= mean(Percent.12Mo), sd_ploss = sd(Percent.12Mo))
+```
+
+```{r}
+SUBJ %>% group_by(Cohort, Cat.12Mo) %>%
+  summarise(count = n()) %>%
+  arrange(Cohort, Cat.12Mo)
+```
+
+Biological samples which were sequenced twice:
+
+```{r}
+(sample_data(ps0) %>% 
+   group_by(Cohort, SampleID) %>% 
+   dplyr::summarise(
+     count = n(), 
+     meas = paste0(MeasID, collapse = "; ")
+     ) %>%
+   filter(count > 1))
+```
+
+```{r}
+new_smp_data <- sample_data(ps0) %>%
+  data.frame() %>%
+  select(-Lane, -MeasID, -OrigSampleDepth) %>%
+  distinct() 
+rownames(new_smp_data) <- new_smp_data$SampleID
+
+dim(new_smp_data)
+```
+
+Combine repeated samples by computing the mean 
+
+```{r}
+ps <- collapse_samples(ps0)
+(ps <- subset_taxa(ps, taxa_sums(ps) > 0))
+#sample_data(ps)$Cat.12Mo[is.na(sample_data(ps)$Cat.12Mo)] <- "Unknown"
+# sample_data(ps)$Cat.12Mo <- 
+#   factor(sample_data(ps)$Cat.12Mo, levels = c("US", "MS", "VS", "Unknown")) 
+sample_data(ps)$Cat.12Mo <-
+  factor(sample_data(ps)$Cat.12Mo, levels = c("US", "MS", "VS"))
+```
+
+
+## Experimental Design
+
+```{r}
+diet_cols <- c("US" = "#E41A1C", "MS" = "#377EB8", "VS" = "#4DAF4A", "Unknown" = "grey")
+```
+
+
+```{r exp-design-cohort2-low-carb, fig.height=6.5, fig.width=10}
+subj_bl_weight <- sample_data(ps) %>%
+  select(SubjectID, Weight_kg.BL) %>%
+  distinct() %>%
+  arrange(Weight_kg.BL)
+SMP <- data.frame(sample_data(ps)) %>%
+  mutate(
+    SubjectID_factor = factor(SubjectID, levels = subj_bl_weight$SubjectID),
+    Cohort = ifelse(Cohort == 2, "Discovery", "Validation"))
+  
+plt_exp_carb <- ggplot(
+  SMP %>% filter(Diet == "Low-carb", Cohort == "Discovery"),
+  aes(y = SubjectID_factor, x = SampleDate)) + 
+  geom_point(aes(shape = Timepoint), fill = diet_cols[1], size = 4) +
+  scale_shape_manual(values = c("Baseline" = 21, "10 Week" = 24)) +
+  ylab("SubjectID") + xlab("Sample Data")
+plt_exp_carb
+```
+
+
+```{r exp-design-cohort2-low-fat, fig.height=6.5, fig.width=10}
+plt_exp_purple <- ggplot(
+  SMP %>% filter(Diet == "Low-fat", Cohort == "Discovery"),
+  aes(y = SubjectID_factor, x = SampleDate)) + 
+  geom_point(aes(shape = Timepoint), size = 4, fill = diet_cols[2]) +
+  scale_shape_manual(values = c("Baseline" = 21, "10 Week" = 24)) +
+  ylab("SubjectID") + xlab("Sample Data")
+plt_exp_purple
+```
+
+```{r exp-design-cohort3-low-carb, fig.height=5, fig.width=7}
+plt_exp_carb <- ggplot(
+  SMP %>% filter(Diet == "Low-carb", Cohort == "Validation"),
+  aes(y = SubjectID_factor, x = SampleDate)) + 
+  geom_point(aes(shape = Timepoint), fill = diet_cols[1], size = 4) +
+  scale_shape_manual(values = c("Baseline" = 21, "10 Week" = 24)) +
+  ylab("SubjectID") + xlab("Sample Data")
+plt_exp_carb
+```
+
+```{r exp-design-cohort3-low-fat, fig.height=5, fig.width=7}
+plt_exp_purple <- ggplot(
+  SMP %>% filter(Diet == "Low-fat", Cohort == "Validation"),
+  aes(y = SubjectID_factor, x = SampleDate)) + 
+  geom_point(aes(shape = Timepoint), size = 4, fill = diet_cols[2]) +
+  scale_shape_manual(values = c("Baseline" = 21, "10 Week" = 24)) +
+  ylab("SubjectID") + xlab("Sample Data")
+plt_exp_purple
+```
+
+
+
+
+## Data transformation
+
+```{r}
+psasinh <- transform_sample_counts(ps, function(x) {asinh(x)})
+psasinh_cohort2 <- subset_samples(psasinh, Cohort == 2)
+(psasinh_cohort2 <- subset_taxa(psasinh_cohort2, taxa_sums(psasinh_cohort2) > 0))
+psasinh_cohort3 <- subset_samples(psasinh, Cohort == 3)
+(psasinh_cohort3 <- subset_taxa(psasinh_cohort3, taxa_sums(psasinh_cohort3) > 0))
+```
+
+
+
+
+# Princopal Coordinate Analysis (PCoA) on asinh data
+
+```{r}
+## Ordinate with Bray-Curtis distance
+pcoa_all <- ordinate(psasinh,  method = "MDS", distance = "bray")
+pcoa_cohort2 <- ordinate(psasinh_cohort2,  method = "MDS", distance = "bray")
+pcoa_cohort3 <- ordinate(psasinh_cohort3,  method = "MDS", distance = "bray")
+
+# Compute variance explained
+var_exp_all <- get_evals(pcoa_all)$variance_exp
+var_exp_cohort2 <- get_evals(pcoa_cohort2)$variance_exp
+var_exp_cohort3 <- get_evals(pcoa_cohort3)$variance_exp
+
+scores_all <- get_scores(pcoa_all, sample_data(psasinh))
+scores_cohort2 <- get_scores(pcoa_cohort2, sample_data(psasinh_cohort2))
+scores_cohort3 <- get_scores(pcoa_cohort3, sample_data(psasinh_cohort3))
+```
+
+
+## Weight-loss Success Categories
+
+* PCoA on all samples for both cohorts:
+
+```{r pcoa-bray-all, fig.height=8, fig.width=15}
+tmp_shapes <- ifelse(scores_all %>% filter(!is.na(Diet), !is.na(Cohort)) %>%
+                       .[["Timepoint"]] == "Baseline", 21, 24)
+  
+plot_ordination(scores_all %>% filter(!is.na(Diet), !is.na(Cohort)),
+  var_exp_all, color_column = "Cat.12Mo", 
+  colors = diet_cols, shape = tmp_shapes) +
+  facet_grid(Timepoint ~ Cohort + Diet, drop = TRUE) +
+  guides(
+    fill = guide_legend(
+      title = "Weight Loss Success", 
+      override.aes = list(shape = 21)),
+    color = "none")
+```
+
+* PCoA on all samples for both cohorts only baseline samples
+
+
+```{r pcoa-bray-all-bl, fig.height=5, fig.width=12}
+plot_ordination(
+  scores_all %>% 
+    filter(!is.na(Diet), !is.na(Cohort), Timepoint == "Baseline"),
+  var_exp_all, color_column = "Cat.12Mo", colors = diet_cols) +
+  facet_grid(~  Diet ) +
+   guides(
+    fill = guide_legend(
+      title = "Weight Loss Success", 
+      override.aes = list(shape = 21)),
+    color = "none")
+```
+
+* PCoA on all samples for both cohorts showing only baseline samples and
+cohorts separately
+
+
+```{r pcoa-bray-all-bl-facet, fig.height=10, fig.width=12}
+plot_ordination(
+  scores_all %>% 
+    filter(!is.na(Diet), !is.na(Cohort), Timepoint == "Baseline"),
+  var_exp_all, color_column = "Cat.12Mo", colors = diet_cols) +
+  facet_grid(Cohort ~ Diet) +
+   guides(
+    fill = guide_legend(
+      title = "Weight Loss Success", 
+      override.aes = list(shape = 21)),
+    color = "none")
+```
+
+
+* PCoA on samples from cohort 2
+
+
+```{r pcoa-bray-cohort2, fig.height=10, fig.width=12}
+tmp_shapes <- ifelse(
+  scores_cohort2 %>% filter(!is.na(Diet)) %>% .[["Timepoint"]] == "Baseline", 
+  21, 24)
+   
+plot_ordination(scores_cohort2 %>% filter(!is.na(Diet)),
+  var_exp_cohort2,color_column = "Cat.12Mo", 
+  colors = diet_cols, shape = tmp_shapes) +
+  facet_grid(Timepoint ~ Diet) +
+   guides(
+    fill = guide_legend(
+      title = "Weight Loss Success", 
+      override.aes = list(shape = 21)),
+    color = "none")
+```
+
+* PCoA on samples from cohort 2 only baseline samples shown
+
+```{r pcoa-bray-cohort2-bl, fig.height=6, fig.width=12}
+discov_bl <- scores_cohort2 %>% 
+  filter(!is.na(Diet), Timepoint == "Baseline") %>%
+  mutate(Cohort = "Discovery")
+
+plot_ordination(discov_bl,
+  var_exp_cohort2,color_column = "Cat.12Mo", colors = diet_cols) +
+  facet_grid( ~ Diet, drop = TRUE) +
+   guides(
+    fill = guide_legend(
+      title = "Weight Loss \n Success", 
+      override.aes = list(shape = 21)),
+    color = "none")
+```
+
+
+```{r  pcoa-bray-cohort2-bl-convex-hull, fig.height=6, fig.width=12}
+chulls <- plyr::ddply(
+  discov_bl, c("Cat.12Mo", "Diet"), 
+  function(df) df[chull(df$PC1, df$PC2), ])
+
+
+ggplot(discov_bl, aes(x = PC1, y = PC2, fill = Cat.12Mo)) +
+  geom_polygon(data = chulls,aes(group = Cat.12Mo), alpha = 0.1) +
+  geom_polygon(aes(group = SubjectID_Timepoint)) +
+  geom_path(aes(group = SubjectID_Timepoint, color = Cat.12Mo)) +
+  geom_point(size = 3, color = "grey10", shape = 21) +
+  xlab(sprintf("PC1 [%s%% variance]", round(var_exp_cohort2[1], 2))) +
+  ylab(sprintf("PC2 [%s%% variance]", round(var_exp_cohort2[2], 2))) +
+  coord_fixed() + theme(text = element_text(size = 20)) +
+  facet_grid( ~ Diet, drop = TRUE) +
+  scale_fill_manual(values = diet_cols, na.value = "grey") +
+  scale_color_manual(values = diet_cols, na.value = "grey") +
+  guides(
+    fill = guide_legend(
+      title = "Weight Loss Success", 
+      override.aes = list(shape = 21)),
+    color = "none") +
+  theme(legend.position = "top", text = element_text(size = 25))
+
+
+```
+
+
+* PCoA on samples from cohort 3 (only baseline samples avaiable)
+
+```{r pcoa-bray-cohort3, fig.height=5, fig.width=12}
+valid <- scores_cohort3 %>% 
+  filter(!is.na(Diet)) %>%
+  mutate(Cohort = "Validation")
+
+plot_ordination(valid,
+  var_exp_cohort3,color_column = "Cat.12Mo", colors = diet_cols) +
+  facet_grid( ~ Diet) +
+   guides(
+    fill = guide_legend(
+      title = "Weight Loss \n Success", 
+      override.aes = list(shape = 21)),
+    color = "none")
+```
+
+```{r  pcoa-bray-cohort3-bl-convex-hull, fig.height=6, fig.width=12}
+
+chulls <- plyr::ddply(
+  valid, c("Cat.12Mo", "Diet"),
+  function(df) df[chull(df$PC1, df$PC2), ])
+
+
+ggplot(valid, aes(x = PC1, y = PC2, fill = Cat.12Mo)) +
+  geom_polygon(data = chulls, aes(group = Cat.12Mo), alpha = 0.1) +
+  geom_polygon(aes(group = SubjectID_Timepoint)) +
+  geom_path(aes(group = SubjectID_Timepoint, color = Cat.12Mo)) +
+  geom_point(size = 3, color = "grey10", shape = 21) +
+  xlab(sprintf("PC1 [%s%% variance]", round(var_exp_cohort3[1], 2))) +
+  ylab(sprintf("PC2 [%s%% variance]", round(var_exp_cohort3[2], 2))) +
+  coord_fixed() + theme(text = element_text(size = 20)) +
+  facet_grid( ~ Diet, drop = TRUE) +
+  scale_fill_manual(values = diet_cols, na.value = "grey") +
+  scale_color_manual(values = diet_cols, na.value = "grey") +
+ guides(
+  fill = guide_legend(
+    title = "Weight Loss Success", 
+    override.aes = list(shape = 21)),
+  color = "none") +
+  theme(legend.position = "top", text = element_text(size = 25))
+
+```
+
+
+```{r pcoa-bray-all-bl-convex-hull, fig.height=10, fig.width=12}
+discov_bl <- discov_bl %>%
+  left_join(ps0@sam_data[, c("SampleID", "Lane")])
+valid <- valid %>%
+  left_join(ps0@sam_data[, c("SampleID", "Lane")])
+bl_DF <- bind_rows(discov_bl, valid)
+chulls <- plyr::ddply(bl_DF, c("Cat.12Mo", "Diet", "Cohort"),
+                      function(df) df[chull(df$PC1, df$PC2), ])
+
+
+ggplot(bl_DF, aes(x = PC1, y = PC2, fill = Cat.12Mo)) +
+  geom_polygon(data = chulls, aes(group = Cat.12Mo), alpha = 0.2) +
+  geom_polygon(aes(group = SubjectID_Timepoint)) +
+  geom_path(aes(group = SubjectID_Timepoint, color = Cat.12Mo)) +
+  geom_point(size = 3, color = "grey10", shape = 21) +
+  xlab(sprintf("PC1 [%s%% variance]", round(var_exp_cohort2[1], 2))) +
+  ylab(sprintf("PC2 [%s%% variance]", round(var_exp_cohort2[2], 2))) +
+  coord_fixed() + theme(text = element_text(size = 20)) +
+  facet_grid(Cohort ~ Diet, drop = TRUE) +
+  scale_fill_manual(values = diet_cols, na.value = "grey") +
+  scale_color_manual(values = diet_cols, na.value = "grey")
+
+```
+
+
+## BMI
+
+* PCoA on samples from cohort 2 only baseline samples shown
+
+
+```{r pcoa-bray-all-bl-bmi, fig.height=5, fig.width=16}
+
+plot_ordination(bl_DF,
+  var_exp_cohort2,color_column = "bmi_bl", color_continuous = TRUE) +
+  facet_grid( ~ Cohort + Diet, drop = TRUE) +
+  scale_color_viridis_c() +
+  scale_fill_viridis_c()
+
+```
+
+
+```{r pcoa-bray-cohort2-bl-bmi, fig.height=6, fig.width=12}
+plot_ordination(discov_bl ,
+  var_exp_cohort2, color_column = "bmi_bl", color_continuous = TRUE) +
+  facet_grid( ~ Diet, drop = TRUE)  +
+  scale_color_viridis_c() +
+  scale_fill_viridis_c()
+```
+
+* PCoA on samples from cohort 3 only baseline samples shown
+
+
+```{r pcoa-bray-cohort3-bl-bmi, fig.height=5, fig.width=12}
+plot_ordination(valid %>% filter(!is.na(Diet), Timepoint == "Baseline"),
+  var_exp_cohort3, color_column = "bmi_bl", color_continuous = TRUE) +
+  facet_grid( ~ Diet, drop = TRUE) +
+  scale_color_viridis_c() +
+  scale_fill_viridis_c()
+```
+
+## Mean Adherence
+
+```{r}
+bl_DF <- bl_DF %>%
+  mutate_at(.vars = vars(contains("adherence_")), .funs = as.numeric) %>%
+  mutate(
+    mean_adherence = rowMeans(select(., adherence_12_months:adherence_6_months)),
+    mean_reduction = adherence_baseline - mean_adherence,
+    mean_adherence = 100 - mean_adherence,
+  )
+
+
+discov_bl <- discov_bl %>%
+  mutate_at(.vars = vars(contains("adherence_")), .funs = as.numeric) %>%
+  mutate(
+    mean_adherence = rowMeans(select(., adherence_12_months:adherence_6_months)),
+    mean_reduction = adherence_baseline - mean_adherence,
+    mean_adherence = 100 - mean_adherence,
+  )
+
+valid <- valid  %>%
+  mutate_at(.vars = vars(contains("adherence_")), .funs = as.numeric) %>%
+  mutate(
+    mean_adherence = rowMeans(select(., adherence_12_months:adherence_6_months)),
+    mean_reduction = adherence_baseline - mean_adherence,
+    mean_adherence = 100 - mean_adherence,
+  )
+```
+
+
+* PCoA on samples from cohort 2 only baseline samples shown
+
+
+```{r pcoa-bray-all-bl-adherence, fig.height=5, fig.width=16}
+
+plot_ordination(bl_DF,
+  var_exp_cohort2,color_column = "mean_adherence", color_continuous = TRUE) +
+  facet_grid( ~ Cohort + Diet, drop = TRUE) +
+  scale_color_viridis_c() +
+  scale_fill_viridis_c()
+
+```
+
+
+```{r pcoa-bray-cohort2-bl-adherence, fig.height=6, fig.width=12}
+plot_ordination(discov_bl ,
+  var_exp_cohort2, color_column = "mean_adherence", color_continuous = TRUE) +
+  facet_grid( ~ Diet, drop = TRUE)  +
+  scale_color_viridis_c() +
+  scale_fill_viridis_c()
+```
+
+* PCoA on samples from cohort 3 only baseline samples shown
+
+
+```{r pcoa-bray-cohort3-bl-adherence, fig.height=5, fig.width=12}
+plot_ordination(valid %>% filter(!is.na(Diet), Timepoint == "Baseline"),
+  var_exp_cohort3, color_column = "mean_adherence", color_continuous = TRUE) +
+  facet_grid( ~ Diet, drop = TRUE) +
+  scale_color_viridis_c() +
+  scale_fill_viridis_c()
+```
+
+
+## Mean reduction/diet fidelity
+
+* PCoA on samples from cohort 2 only baseline samples shown
+
+
+```{r pcoa-bray-all-bl-reduction, fig.height=5, fig.width=16}
+
+plot_ordination(bl_DF,
+  var_exp_cohort2,color_column = "mean_reduction", color_continuous = TRUE) +
+  facet_grid( ~ Cohort + Diet, drop = TRUE) +
+  scale_color_viridis_c() +
+  scale_fill_viridis_c()
+
+```
+
+
+```{r pcoa-bray-cohort2-bl-reduction, fig.height=6, fig.width=12}
+plot_ordination(discov_bl ,
+  var_exp_cohort2, color_column = "mean_reduction", color_continuous = TRUE) +
+  facet_grid( ~ Diet, drop = TRUE)  +
+  scale_color_viridis_c() +
+  scale_fill_viridis_c()
+```
+
+* PCoA on samples from cohort 3 only baseline samples shown
+
+
+```{r pcoa-bray-cohort3-bl-reduction, fig.height=5, fig.width=12}
+plot_ordination(valid %>% filter(!is.na(Diet), Timepoint == "Baseline"),
+  var_exp_cohort3, color_column = "mean_reduction", color_continuous = TRUE) +
+  facet_grid( ~ Diet, drop = TRUE) +
+  scale_color_viridis_c() +
+  scale_fill_viridis_c()
+```
+
+
+## Sequencing Run
+
+* PCoA on samples from cohort 2 only baseline samples shown
+
+
+```{r pcoa-bray-all-bl-seqrun, fig.height=5, fig.width=16}
+
+plot_ordination(bl_DF,
+  var_exp_cohort2,color_column = "Lane", color_continuous = TRUE) +
+  facet_grid( ~ Cohort + Diet, drop = TRUE) 
+
+```
+
+
+```{r pcoa-bray-cohort2-bl-seqrun, fig.height=6, fig.width=12}
+plot_ordination(discov_bl ,
+  var_exp_cohort2, color_column = "Lane", color_continuous = TRUE) +
+  facet_grid( ~ Diet, drop = TRUE) 
+```
+
+* PCoA on samples from cohort 3 only baseline samples shown
+
+
+```{r pcoa-bray-cohort3-bl-seqrun, fig.height=5, fig.width=12}
+plot_ordination(valid %>% filter(!is.na(Diet), Timepoint == "Baseline"),
+  var_exp_cohort3, color_column = "Lane", color_continuous = TRUE) +
+  facet_grid( ~ Diet, drop = TRUE) 
+```
+
+
+## Subject Age
+
+* PCoA on samples from cohort 2 only baseline samples shown
+
+
+
+
+```{r pcoa-bray-all-bl-age, fig.height=5, fig.width=16}
+plot_ordination(bl_DF,
+  var_exp_cohort2,color_column = "Age", color_continuous = TRUE) +
+  facet_grid( ~ Cohort + Diet, drop = TRUE) +
+  scale_color_viridis(option = 3, end = 0.90) +
+  scale_fill_viridis(option = 3, end = 0.90) 
+```
+
+
+```{r pcoa-bray-cohort2-bl-age, fig.height=6, fig.width=12}
+
+plot_ordination(discov_bl,
+  var_exp_cohort2,color_column = "Age", color_continuous = TRUE) +
+  facet_grid( ~ Diet, drop = TRUE) +
+  scale_color_viridis(option = 3, end = 0.90) +
+  scale_fill_viridis(option = 3, end = 0.90) 
+```
+
+* PCoA on samples from cohort 3 only baseline samples shown
+
+
+```{r pcoa-bray-cohort3-bl-age, fig.height=5, fig.width=12}
+plot_ordination(scores_cohort3 %>% filter(!is.na(Diet), Timepoint == "Baseline"),
+  var_exp_cohort3, color_column = "Age", color_continuous = TRUE) +
+  facet_grid( ~ Diet, drop = TRUE) +
+  scale_color_viridis(option = 3, end = 0.9) +
+  scale_fill_viridis(option = 3, end = 0.9) 
+```
+
+
+## Gender
+
+* PCoA on samples from cohort 2 only baseline samples shown
+
+```{r pcoa-bray-all-bl-gender, fig.height=5, fig.width=16}
+plot_ordination(bl_DF,
+  var_exp_cohort2,color_column = "Gender", colors = c("#E41A1C", "#377EB8"), 
+  color_continuous = FALSE) +
+  facet_grid( ~ Cohort + Diet, drop = TRUE)
+```
+
+```{r pcoa-bray-cohort2-bl-gender, fig.height=6, fig.width=12}
+plot_ordination(scores_cohort2 %>% filter(!is.na(Diet), Timepoint == "Baseline"),
+  var_exp_cohort2,color_column = "Gender", colors = c("#E41A1C", "#377EB8"), 
+  color_continuous = FALSE) +
+  facet_grid( ~ Diet, drop = TRUE)
+```
+
+* PCoA on samples from cohort 3 only baseline samples shown
+
+
+```{r pcoa-bray-cohort3-bl-gender, fig.height=5, fig.width=12}
+plot_ordination(scores_cohort3 %>% filter(!is.na(Diet), Timepoint == "Baseline"),
+  var_exp_cohort3, color_column = "Gender", colors = c("#E41A1C", "#377EB8"), 
+  color_continuous = FALSE) + facet_grid( ~ Diet, drop = TRUE)
+```
+
+## Subject Shift over time
+
+* PCoA on samples from cohort 2
+
+```{r pcoa-bray-cohort2-timeshift, fig.height=12, fig.width=10}
+
+DF <- scores_cohort2 %>%
+  group_by(SubjectID, Cat.12Mo, Diet, Timepoint) %>%
+  summarise(PC1 = mean(PC1), PC2 = mean(PC2)) %>%
+  filter(!is.na(Diet))
+  
+ggplot(DF, aes(x = PC1, y = PC2)) +
+  geom_path(aes(group = SubjectID), lwd = 1.5, color = "grey50") +
+  geom_text(aes(color = Timepoint, label = SubjectID), size = 4, fontface = "bold") +
+  facet_grid(Cat.12Mo ~ Diet) + 
+  scale_color_manual(
+    values = c("Baseline" = brewer.pal(8, "Dark2")[5], 
+               "10 Week" = brewer.pal(8, "Dark2")[4])) +
+  xlab(sprintf("PC1 [%s%% variance]", round(var_exp_cohort2[1], 2))) +
+  ylab(sprintf("PC2 [%s%% variance]", round(var_exp_cohort2[2], 2))) +
+  coord_fixed() + theme(text = element_text(size = 15)) 
+
+```
+
+
+
+
+
+
+
+
+# PERMANOVA test for overall difference between weight-loss success groups
+
+(Permutational multivariate analysis of variance)
+Null hypothesis: there is no difference in between weight-loss success groups
+
+* Bray-Curtis distance on sequence-level data
+
+
+```{r}
+smpdata <- sample_data(ps0) %>%
+  data.frame() %>%
+  select(MeasID, SubjectID, Timepoint)
+
+subjdata <- sample_data(ps0) %>%
+  data.frame() %>%
+  select(Cohort, Diet, SubjectID, Gender, Age, Weight_kg.BL, Weight_kg.12Mo,
+         Cat.12Mo, Percent.12Mo, Timepoint) %>%
+  distinct() %>%
+  mutate(SubjectID_Timepoint = paste0(SubjectID, "_", Timepoint)) %>%
+  column_to_rownames("SubjectID_Timepoint")
+
+seqtab <- t(asinh(as(otu_table(ps0), "matrix")))
+seqtab_subj <- aggregate(
+  seqtab, FUN = mean,
+  by = list(smpdata[rownames(seqtab), "SubjectID"], 
+            smpdata[rownames(seqtab), "Timepoint"])) %>%
+  mutate(SubjectID_Timepoint = paste0(Group.1, "_", Group.2)) %>%
+  column_to_rownames("SubjectID_Timepoint")
+
+seqtab_subj_mat <- as.matrix(seqtab_subj %>% select(-contains("Group.")))
+seqtab_subj_mat <- t(seqtab_subj_mat)
+
+psasinh_subj <- phyloseq(otu_table(seqtab_subj_mat, taxa_are_rows = TRUE),
+                         sample_data(subjdata))
+```
+
+
+```{r}
+psasinh_subj_bl <- subset_samples(psasinh_subj, Timepoint == "Baseline")
+
+adonis_res <- list()
+for(cohort in c(2, 3)) {
+  cohort_name <- ifelse(cohort == 2, "Discovery", "Validation")
+  cat("Testing for cohort:", cohort_name, ".\n")
+  for(diet in c("Low-carb", "Low-fat")){
+    cat("Testing for diet:", diet, ".\n")
+    test_name <- paste0("Cohort", ".", cohort_name, "_", "Diet", ".", diet)
+    ips <- psasinh_subj_bl %>%
+        subset_samples(Diet == diet & Cohort == cohort)
+    D <- phyloseq::distance(ips, method = "bray")
+    adonis_res[[test_name]] <- 
+      vegan::adonis(D ~ Cat.12Mo, data = data.frame(sample_data(ips)))
+    
+  }
+}
+
+```
+
+
+```{r}
+adonis_res[["Cohort.Discovery_Diet.Low-carb"]]
+```
+
+
+```{r}
+adonis_res[["Cohort.Discovery_Diet.Low-fat"]]
+```
+
+
+```{r}
+adonis_res[["Cohort.Validation_Diet.Low-carb"]]
+```
+
+
+```{r}
+adonis_res[["Cohort.Validation_Diet.Low-fat"]]
+```
+
+
+```{r}
+# psasinh.bySubject <- collapse_physeq_bySubject(psasinh)
+# bl.psasinh.blue <- subset_samples(psasinh.bySubject, Timepoint == "Baseline" & Color == "Blue" & Cohort == 2) 
+# metadata.blue <- as(bl.psasinh.blue@sam_data, "data.frame")
+# set.seed(325525)
+# adonis(distance(bl.psasinh.blue, method = "bray") ~ Cat.12Mo, data = metadata.blue)
+# 
+# bl.psasinh.purple <- subset_samples(psasinh.bySubject, Timepoint == "Baseline" & Color == "Purple" & Cohort == 2)
+# metadata.purple <- as(bl.psasinh.purple@sam_data, "data.frame")
+# set.seed(325525)
+# purp.adonis <- adonis(distance(bl.psasinh.purple, method = "bray") ~ Cat.12Mo, data = metadata.purple)
+# purp.adonis
+```
+
+
+
+
+

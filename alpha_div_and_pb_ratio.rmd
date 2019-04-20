@@ -1,0 +1,793 @@
+---
+title: "Alpha diversity and P/B ratio"
+author: "Lan Huong Nguyen"
+date: "11/19/2018"
+output: 
+  BiocStyle::html_document:
+    toc_float: true
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+#rm(list = ls())
+knitr::opts_chunk$set(
+  echo = TRUE, warning = FALSE, message = FALSE, 
+  fig.path = "../figs/alphadiv_pbra/", dev=c('png', 'pdf'),
+  fig.align = 'center', fig.wide = TRUE, 
+  fig.width = 8, fig.height = 6
+)
+```
+
+# Set up
+
+```{r}
+.packages <- c("gridExtra","RColorBrewer", "viridis", "phyloseq", 
+               "tidyverse", "ggsignif")
+sapply(.packages, require, character.only = TRUE)
+
+options(stringsAsFactors = FALSE)
+theme_set(theme_bw())
+theme_update(
+  text = element_text(size = 25),
+  strip.background = element_rect(fill = "grey95"))
+```
+
+
+
+## Load data
+
+```{r}
+(ps0 <- readRDS("../data/phyloseq/diet_participants_with_adherence.rds"))
+
+# calculate adherence, and Subj_Group variables
+newSam_data <- sample_data(ps0) %>%
+  data.frame() %>%
+  mutate_at(vars(starts_with("adherence")), as.numeric) %>%
+  mutate(adherence.raw = rowMeans(select(., adherence_3_months, adherence_6_months, adherence_12_months), na.rm = T),
+         adherence.pct = 100-adherence.raw, 
+         adherence.changeFromBL = adherence_baseline - adherence.raw,
+         Subj_Group = factor(paste0(SubjectID, "_", Timepoint)), 
+         rowname = MeasID) %>%
+  column_to_rownames("rowname")
+
+
+sample_data(ps0) <- newSam_data
+
+```
+
+
+## Filter out samples with insufficient reads or no weight-loss data at 12 months
+
+```{r}
+minSampleDepth <- 10000
+
+
+(ps0 <- subset_samples(ps0, sample_sums(ps0) > minSampleDepth))
+(ps0 <- subset_samples(ps0, !(SubjectID == "1139" & Timepoint == "10 Week")))
+(ps0 <- subset_samples(ps0, !is.na(Cat.12Mo)))
+ps0 <- subset_taxa(ps0, taxa_sums(ps0) > 0)
+
+```
+
+## Twice-sequenced samples
+
+Find biological samples which were sequenced twice:
+
+```{r}
+(sample_data(ps0) %>% 
+   group_by(SampleID) %>% 
+   dplyr::summarise(
+     count = n(), 
+     meas = paste0(MeasID, collapse = "; ")
+     ) %>%
+   filter(count > 1))
+
+```
+
+
+Combine repeated samples by computing the mean 
+
+```{r}
+collapse_samples <- function(physeq, sample_id = "SampleID", fun = mean){
+  sampledata_collapsed <- sample_data(physeq) %>%
+    dplyr::select(-Lane, -MeasID, -OrigSampleDepth) %>%
+    distinct() 
+  rownames(sampledata_collapsed) <- sampledata_collapsed[[sample_id]]
+  seqtab <- data.frame(as(otu_table(physeq), "matrix"))
+  if(!taxa_are_rows(physeq)) seqtab <- t(seqtab)
+  
+  sample_ids <- physeq@sam_data[[sample_id]]
+  seqtab_collapsed <- sapply(unique(sample_ids), function(id){ 
+    if(sum(sample_ids == id) == 1) return(seqtab[, sample_ids == id])
+    apply(seqtab[, sample_ids == id], 1, fun)
+  })
+  rownames(seqtab_collapsed) <- rownames(seqtab)
+  physeq_collapsed <- phyloseq(
+    otu_table(seqtab_collapsed, taxa_are_rows = TRUE),
+    sample_data(sampledata_collapsed), 
+    tax_table(physeq), phy_tree(physeq))
+  return(physeq_collapsed)
+}
+```
+
+
+
+```{r}
+ps0 <- collapse_samples(ps0)
+ps0
+sample_data(ps0)$Cat.12Mo <- 
+  factor(sample_data(ps0)$Cat.12Mo, levels = c("US", "MS", "VS"))
+```
+
+# Separate into different phyloseq objects for each cohort
+```{r}
+(ps2 <- subset_samples(ps0, Cohort == 2))
+(ps2 <- subset_taxa(ps2, taxa_sums(ps2) > 0))
+
+(ps3 <- subset_samples(ps0, Cohort == 3))
+(ps3 <- subset_taxa(ps3, taxa_sums(ps3) > 0))
+
+```
+
+Get only baseline samples
+
+```{r}
+(ps.bl <- subset_samples(ps0, Timepoint == "Baseline"))
+```
+
+```{r}
+table(sample_data(ps.bl)$Subject)
+
+length(unique(sample_data(ps.bl)$Subject))
+
+```
+
+
+```{r}
+subj_with_mult_days <- sample_data(ps.bl) %>% 
+  group_by(SubjectID) %>%
+  dplyr::summarise(
+    no_uniq_days = length(unique(SampleDate)),
+    uniq_days = paste0(unique(as.character(sort(as.Date(SampleDate)))),
+                       collapse = "; ")
+  ) %>%
+  filter(no_uniq_days > 1)
+head(subj_with_mult_days)
+
+
+
+subj_with_mult_days_cohort3 <- sample_data(ps3) %>% 
+  group_by(SubjectID) %>%
+  dplyr::summarise(
+    no_uniq_days = length(unique(SampleDate)),
+    uniq_days = paste0(unique(as.character(sort(as.Date(SampleDate)))),
+                       collapse = "; ")
+  ) %>%
+  filter(no_uniq_days > 1)
+head(subj_with_mult_days_cohort3)
+```
+
+```{r}
+ps.bl <- ps.bl %>% subset_samples(SubjectID %in% subj_with_mult_days$SubjectID)
+ps.bl
+
+ps3.bl <- ps3 %>% subset_samples(SubjectID %in% subj_with_mult_days_cohort3$SubjectID)
+ps3.bl
+```
+
+```{r}
+diet_cols <- c(brewer.pal(9, "Set1")[2], brewer.pal(9, "Set1")[5])
+```
+
+
+# Provotella / Bacteroides ratio
+
+Calculate PB ratio per sample and then take average for each subject
+```{r}
+taxtab <- data.frame(ps0@tax_table) %>%
+  rownames_to_column("SeqName") %>%
+  dplyr::select(-Seq)
+
+prevotella_bacteroides <- taxtab %>%
+  filter( grepl("Prevo", Genus) | grepl("Bacter", Genus)) %>%
+  filter(!grepl("Prevotellaceae", Genus))
+
+table(prevotella_bacteroides$Genus)
+```
+
+
+```{r}
+#find all taxa identified as Prevotella or Bacteroides
+prevotella_bacteroides <- prevotella_bacteroides %>%
+  mutate(Genus = ifelse(grepl("Prevo", Genus) , "Prevotella", Genus)) 
+table(prevotella_bacteroides$Genus)
+```
+
+```{r}
+#get phyloseq object with only P and B
+ps_PB <- subset_taxa(
+  ps0, taxa_names(ps0) %in% prevotella_bacteroides$SeqName)
+ps_PB
+```
+
+
+```{r}
+tax_table(ps_PB)[, "Genus"] <- 
+  sapply(tax_table(ps_PB)[, "Genus"], function(x) {
+    ifelse(grepl("Prevo", x), "Prevotella", x)
+  })
+table(tax_table(ps_PB)[, "Genus"])
+```
+
+
+```{r}
+ps_PB <- merge_taxa(ps_PB, eqtaxa = "Genus")
+ps_PB
+```
+
+## Calculate P/B ratio
+
+```{r}
+pb_ratio <- data.frame(
+  (as(otu_table(ps_PB), "matrix")), check.names = FALSE) %>%
+  rownames_to_column("SeqName") %>%
+  left_join(
+    data.frame(tax_table(ps_PB)) %>%
+      rownames_to_column("SeqName") %>%
+      dplyr::select(SeqName, Genus)) %>%
+  group_by(Genus) %>%
+  column_to_rownames("SeqName") %>%
+  summarise_all(.funs = sum) %>%
+  column_to_rownames("Genus")
+
+pb_ratio <- t(pb_ratio) %>%
+  as.data.frame() %>%
+  rownames_to_column("SampleID") %>%
+  mutate(
+    Ratio = ifelse(Prevotella == 0 & Bacteroides == 0, 0, Prevotella/Bacteroides),
+    logRatio = log10((Prevotella + 1)/(Bacteroides+1))) %>%
+  left_join(data.frame(sample_data(ps_PB)) %>%
+              dplyr::select(SampleID, SubjectID, Cohort, Diet, Cat.12Mo, 
+                     Percent.12Mo, Timepoint)) %>%
+  filter(!is.na(Cat.12Mo) & !is.na(Cohort)) %>%
+  mutate(Cohort = factor(Cohort, levels = c(2, 3), 
+                         labels = c("Discovery", "Validation")))
+
+pb_ratio_summary <- pb_ratio %>%
+  group_by(SubjectID, Timepoint, Cohort, Cat.12Mo, Diet) %>%
+  dplyr::summarise(meanPBratio = mean(Ratio), medianPBratio = median(Ratio), 
+                   mean_logPBratio = mean(logRatio), median_logPBratio = median(logRatio)) 
+head(pb_ratio_summary)
+```
+
+```{r}
+pb_ratio_summary %>%
+  filter(Timepoint == "Baseline") %>%
+  group_by(Cohort) %>%
+  summarise(frac_above = sum(meanPBratio > 0.01))
+```
+
+```{r pb-ratio-cohort-2-bySample, fig.height=6, fig.width=15}
+pb.ratio_2 <- ggplot() +
+    geom_boxplot(
+        data = pb_ratio_summary %>% 
+            filter(Timepoint == "Baseline", Cohort == "Discovery"), 
+        aes(x = Cat.12Mo, y = mean_logPBratio, color = Diet),
+        outlier.shape = NA) +
+    geom_jitter(
+        data = pb_ratio %>%
+            filter(Timepoint == "Baseline", Cohort == "Discovery"), 
+        aes(x = Cat.12Mo, y = logRatio), color = "grey55", size = 1.5, 
+        width = 0.2
+    ) + 
+    geom_jitter(
+        data = pb_ratio_summary %>%
+            filter(Timepoint == "Baseline", Cohort == "Discovery"),
+        aes(x = Cat.12Mo, y = mean_logPBratio, color = Diet),
+        size = 4, height = 0, width = 0.1, shape = 17
+    ) +
+    # ggpubr::stat_compare_means(
+    #     data = pb_ratio_summary %>% 
+    #         filter(Timepoint == "Baseline",
+    #                Cohort == "Discovery", Cat.12Mo != "MS"),
+    #     aes(x = Cat.12Mo, y = mean_logPBratio),
+    #     size = 6, label = "p.format", na.rm = TRUE) +
+    stat_signif(
+        data = pb_ratio_summary %>%
+            filter(Timepoint == "Baseline", Cohort == "Discovery"),
+        aes(x = Cat.12Mo, y = mean_logPBratio),
+        stat = "signif",
+        comparisons = list(c("VS", "US")),
+        test = "wilcox.test",
+        test.args = list(alternative = "two.sided"),
+        margin_top = -0.15 , map_signif_level = FALSE,
+        vjust = 9, hjust = -0.3, textsize = 6) +
+    facet_wrap(~ Diet, scale = "free") +
+    scale_color_manual(values = diet_cols) +
+    labs(y = expression(paste(log[10], " (P/B)")), 
+         x = "12-month weight loss success") + 
+    theme(legend.position="none", 
+          text = element_text(size = 30)) + 
+    coord_flip() #+ ylim(-5.5,4.1)
+
+plot_pb_2 <- ggplot_build(pb.ratio_2)
+p.val <- plot_pb_2$data[[4]]$annotation
+new_p.val <- as.factor(paste0("p=", p.val))
+plot_pb_2$data[[4]]$annotation <- new_p.val
+
+newPlot <- ggplot_gtable(plot_pb_2)
+
+plot(newPlot)
+```
+
+```{r pb-ratio-cohort-3-bySample, fig.height=6, fig.width=15}
+pb.ratio_3 <- ggplot() +
+  geom_boxplot(data = pb_ratio_summary %>% filter(Timepoint == "Baseline", Cohort == "Validation"),
+               aes(x = Cat.12Mo, y = mean_logPBratio, color = Diet), outlier.shape = NA) +
+  geom_jitter(data = pb_ratio %>% filter(Timepoint == "Baseline", Cohort == "Discovery"), 
+              aes(x = Cat.12Mo, y = logRatio), color = "grey66", size = 1.5, width = 0.2) + 
+  geom_jitter(data = pb_ratio_summary %>% filter(Timepoint == "Baseline", Cohort == "Validation"),
+              aes(x = Cat.12Mo, y = mean_logPBratio, color = Diet), size = 4, height = 0, width = 0.1, shape = 17) +
+  stat_signif(data = pb_ratio_summary %>% filter(Timepoint == "Baseline", Cohort == "Validation"),
+              aes(x = Cat.12Mo, y = mean_logPBratio),
+              stat = "signif", 
+              comparisons = list(c("VS", "US")),
+              test = "wilcox.test", 
+              test.args = list(alternative = "two.sided"),
+               margin_top = -0.15, vjust = 9, hjust = -.3, textsize = 6) + #, 
+  facet_wrap(~ Diet, scale = "free") +
+  scale_color_manual(values = diet_cols) +
+  labs(y = expression(paste(log[10], " (P/B)")), x = "12-month weight loss success") + 
+  theme(legend.position="none", text = element_text(size = 30)) + coord_flip() #+ ylim(-5.5,4.1)
+
+plot_pb_3 <- ggplot_build(pb.ratio_3)
+p.val <- plot_pb_3$data[[4]]$annotation
+new_p.val <- as.factor(paste0("p=", p.val))
+plot_pb_3$data[[4]]$annotation <- new_p.val
+
+newPlot <- ggplot_gtable(plot_pb_3)
+
+plot(newPlot)
+```
+
+
+```{r}
+wtest_pb <- pb_ratio_summary %>%
+  ungroup() %>%
+  filter(Cat.12Mo %in% c("US", "VS")) %>%
+  mutate(Cat.12Mo = factor(Cat.12Mo, levels = c("US", "VS"), ordered = TRUE)) %>%
+  group_by(Cohort, Timepoint, Diet) %>%
+  data.frame() %>%
+  do(broom::tidy(wilcox.test(formula = mean_logPBratio ~ Cat.12Mo, data = (.))))
+wtest_pb
+```
+
+
+
+
+```{r}
+table(wtest_pb$Cat.12Mo)
+```
+
+
+# Alpha-Diversity
+
+## Discovery Cohort
+
+### Low-Carb diet
+```{r}
+blueBL <- subset_samples(ps.bl, Color == "Blue" & Cohort == 2)
+blueBL <- prune_taxa(taxa_sums(blueBL) > 0, blueBL)
+blueBL
+
+blueBL_cnts <- as(blueBL@otu_table, "matrix")
+blueBL_cnts <- data.frame(t(blueBL_cnts))
+blueBL_smp <- data.frame(blueBL@sam_data)
+```
+
+
+```{r, eval = FALSE}
+# rarelevel1 <- unique(floor(10^(seq(2, 4, length.out = 20))/100)*100)
+# blue_curves <- lapply(1:nsamples(blueBL), function(i) {
+#   cat("Sample no.", i, "\n")
+#   icounts <- blueBL_cnts[i, ]
+#   stepRare <- c(rarelevel1, seq(11000, sum(icounts), by = 1000))
+#   icurve <- phylocurve(icounts, blueBL@phy_tree, stepm = stepRare,
+#                        subsampling = "individual", replace = TRUE,
+#                        verbose = FALSE)
+#   df <- data.frame(m = icurve[, 1], pdrare = icurve[, 2],
+#                    pdvar = icurve[, 3], blueBL_smp[rep(i, nrow(icurve)), ])
+#   return(df)
+# })
+# blue_curves_df <- do.call("rbind", blue_curves)
+# saveRDS(blue_curves_df, file = "FINAL ANALYSIS/data/alphaDiversity/diet_phylocurves_blue_cohort2.rda")
+
+#load("FINAL ANALYSIS/data/alphaDiversity/diet_phylocurves.rda")
+```
+
+```{r}
+blue_curves_df <- readRDS("../data/alphaDiversity/diet_phylocurves_blue_cohort2.rda")
+```
+
+
+
+
+```{r}
+plot_alphadiver_curves <- function(df, cutoff = 11000, color = "Percent.12Mo"){
+  ggplot(df, aes_string(group = "SampleID", color = color, x = "m", y = "pdrare")) + 
+    geom_line(lwd = 0.8) + 
+    geom_line(aes(y = pdrare + sqrt(pdvar)), lty = 3, lwd = 0.3) + 
+    geom_line(aes(y = pdrare - sqrt(pdvar)), lty = 3, lwd = 0.3) + 
+    scale_x_log10(breaks = c(100, 1000, 10000, 100000)) +
+    ylab("Expected Phylogenetic Diversity") + xlab("Rarefaction size") +
+    geom_vline(xintercept = cutoff) +
+    scale_color_viridis(discrete = !is.numeric(df[[color]])) +
+    theme(text = element_text(size = 20))
+}
+
+plot_alphadiver_boxplot <- function(df, cutoff = 11000){
+  df <- df %>% filter(floor(m) == cutoff)
+  ggplot(df, aes(x = Cat.12Mo, y = pdrare)) +
+    geom_boxplot() + scale_color_viridis() +
+    geom_jitter(aes(color = Percent.12Mo), width = 0.3, size = 1) +
+    stat_signif(
+      aes(y = pdrare, x = Cat.12Mo),
+      stat = "signif", comparisons = list(c("VS", "US")), 
+      test = "wilcox.test", test.args = list(alternative = "two.sided"), 
+      manual = FALSE, y_position = 30, textsize = 5) + 
+    ylab("Expected Phylogenetic Diversity") + xlab("12-month weight loss success category") +
+    theme(text = element_text(size = 20))
+}
+
+
+
+plot_alphadiver <- function(
+  df, cutoff = 11000, vp = grid::viewport(
+    width = 0.3, height = 0.32, x = 0.1, y = 0.76, just = c("left", "top"))) {
+  p0 <- plot_alphadiver_curves(df, cutoff = cutoff, color = "Percent.12Mo") + ylim(0,36) + labs(color = "Percent weight loss at 12-months") + theme(legend.position = "top", legend.title=element_text(size=14)) + guides(color = guide_colourbar(barwidth = 15, title.position = "top"))
+  p1 <- plot_alphadiver_boxplot(df, cutoff = cutoff) + 
+  guides(color = "none") + xlab("") + ylab("") +
+  theme(panel.background = element_rect(fill = "transparent",colour = NA),
+        plot.background = element_rect(fill = "transparent",colour = NA),
+        text = element_text(size = 15)) + ylim(5, 33) 
+  print(p0)
+  theme_set(theme_bw(base_size = 8))
+  print(p1, vp = vp)
+  theme_set(theme_bw())
+}
+
+```
+
+
+
+```{r phylocurves-blue-bl-per12-cohort2, fig.width=10, fig.height=6}
+plot_alphadiver_curves(blue_curves_df) 
+```
+
+```{r}
+blue_curves_df <- blue_curves_df %>%
+  left_join(blueBL_smp %>%
+              select(SampleID, adherence.changeFromBL, adherence.pct), 
+            by = c("SampleID"))
+```
+
+```{r phylocurves-blue-bl-reduction-cohort2, fig.width=10, fig.height=6}
+plot_alphadiver_curves(blue_curves_df, color = "adherence.changeFromBL") +
+  scale_color_viridis(option = "inferno") 
+```
+
+```{r phylocurves-blue-bl-adherence-cohort2, fig.width=10, fig.height=6}
+plot_alphadiver_curves(blue_curves_df, color = "adherence.pct") +
+  scale_color_viridis() 
+```
+
+
+
+```{r phylocurves-blue-bl-gender-cohort2, fig.width=10, fig.height=6}
+plot_alphadiver_curves(blue_curves_df, color = "Gender") +
+  scale_color_brewer(palette = "Dark2") 
+```
+
+
+```{r alphadiv-blue-bl-cohort2, fig.width=7, fig.height=6}
+plot_alphadiver(blue_curves_df)
+```
+
+
+```{r}
+(blue_PD_summary_cohort2 <- blue_curves_df %>%
+   filter(floor(m) == 11000) %>%
+   group_by(Cat.12Mo) %>%
+   summarise(mean(pdrare), sd(pdrare)))
+  
+with(blue_curves_df %>%
+   filter(floor(m) == 11000), wilcox.test(
+  pdrare[Cat.12Mo == "US"], pdrare[Cat.12Mo == "VS"]))
+
+```
+
+
+
+
+
+
+### Low-Fat diet
+
+
+```{r}
+purpBL <- subset_samples(ps.bl, Color == "Purple" & Cohort == 2)
+purpBL <- prune_taxa(taxa_sums(purpBL) > 0, purpBL)
+purpBL
+
+purpBL_cnts <- as(purpBL@otu_table, "matrix")
+purpBL_cnts <- data.frame(t(purpBL_cnts))
+purpBL_smp <- data.frame(purpBL@sam_data)
+```
+
+
+```{r}
+# purp_curves <- lapply(1:nsamples(purpBL), function(i) {
+#   cat("Sample no.", i, "\n")
+#   icounts <- purpBL_cnts[i, ]
+#   stepRare <- c(rarelevel1, seq(11000, sum(icounts), by = 1000))
+#   icurve <- phylocurve(icounts, purpBL@phy_tree, stepm = stepRare,
+#                        subsampling = "individual", replace = TRUE,
+#                        verbose = FALSE)
+#   df <- data.frame(m = icurve[, 1], pdrare = icurve[, 2],
+#                    pdvar = icurve[, 3], purpBL_smp[rep(i, nrow(icurve)), ])
+#   return(df)
+# })
+# purp_curves_df <- do.call("rbind", purp_curves)
+# save(list  = c("blue_curves_df", "purp_curves_df"), file = "diet_phylocurves_cohort2.rda")
+# saveRDS(purp_curves_df, file = "FINAL ANALYSIS/data/alphaDiversity/diet_phylocurves_purple_cohort2.rda")
+
+
+purp_curves_df <- readRDS("../data/alphaDiversity/diet_phylocurves_purple_cohort2.rda")
+```
+
+```{r}
+alphadiver_cohort2 <- bind_rows(blue_curves_df, purp_curves_df) %>%
+  filter(floor(m) == 11000)
+```
+
+
+
+```{r phylocurves-purp-bl-per12-cohort2, fig.width=10, fig.height=6}
+plot_alphadiver_curves(purp_curves_df) 
+```
+
+
+
+
+```{r}
+purp_curves_df <- purp_curves_df %>%
+  left_join(purpBL_smp %>%
+              select(SampleID, adherence.changeFromBL, adherence.pct), 
+            by = c("SampleID"))
+```
+
+```{r phylocurves-purp-bl-reduction-cohort2, fig.width=10, fig.height=6}
+plot_alphadiver_curves(purp_curves_df, color = "adherence.changeFromBL") +
+  scale_color_viridis(option = "inferno") 
+```
+
+```{r phylocurves-purp-bl-adherence-cohort2, fig.width=10, fig.height=6}
+plot_alphadiver_curves(purp_curves_df, color = "adherence.pct") +
+  scale_color_viridis() 
+```
+
+
+```{r phylocurves-purp-bl-age-cohort2, fig.width=10, fig.height=6}
+plot_alphadiver_curves(purp_curves_df, color = "Age") +
+  scale_color_viridis(option = "inferno", end = 0.85) 
+```
+
+```{r phylocurves-purp-bl-gender-cohort2, fig.width=10, fig.height=6}
+plot_alphadiver_curves(purp_curves_df, color = "Gender") +
+  scale_color_brewer(palette = "Set2") 
+```
+
+
+```{r alphadiv-purp-bl-cohort2, fig.width=7, fig.height=6}
+plot_alphadiver(purp_curves_df)
+```
+
+
+
+```{r}
+(purple_PD_summary_cohort2 <- purp_curves_df %>%
+   filter(floor(m) == 11000) %>%
+   group_by(Cat.12Mo) %>%
+   summarise(mean(pdrare), sd(pdrare)))
+  
+with(purp_curves_df %>%
+   filter(floor(m) == 11000), wilcox.test(
+  pdrare[Cat.12Mo == "US"], pdrare[Cat.12Mo == "VS"]))
+
+```
+
+## Validation Cohort
+
+### Low-Carb diet
+```{r}
+blueBL <- subset_samples(ps0, Timepoint == "Baseline" & Color == "Blue" & Cohort == 3)
+blueBL <- prune_taxa(taxa_sums(blueBL) > 0, blueBL)
+blueBL
+
+blueBL_cnts <- as(blueBL@otu_table, "matrix")
+blueBL_cnts <- data.frame(t(blueBL_cnts))
+blueBL_smp <- data.frame(blueBL@sam_data)
+
+```
+
+```{r}
+#rarelevel1 <- unique(floor(10^(seq(2, 4, length.out = 20))/100)*100)
+# blue_curves <- lapply(1:nsamples(blueBL), function(i) {
+#   cat("Sample no.", i, "\n")
+#   icounts <- blueBL_cnts[i, ]
+#   stepRare <- c(rarelevel1, seq(11000, sum(icounts), by = 1000))
+#   icurve <- phylocurve(icounts, blueBL@phy_tree, stepm = stepRare,
+#                        subsampling = "individual", replace = TRUE,
+#                        verbose = FALSE)
+#   df <- data.frame(m = icurve[, 1], pdrare = icurve[, 2],
+#                    pdvar = icurve[, 3], blueBL_smp[rep(i, nrow(icurve)), ])
+#   return(df)
+# })
+# blue_curves_df <- do.call("rbind", blue_curves)
+# saveRDS(blue_curves_df, file = "FINAL ANALYSIS/data/alphaDiversity/diet_phylocurves_blue_cohort3.rda")
+
+#load("FINAL ANALYSIS/data/alphaDiversity/diet_phylocurves.rda")
+blue_curves_df <- readRDS("../data/alphaDiversity/diet_phylocurves_blue_cohort3.rda")
+```
+
+```{r phylocurves-blue-bl-per12-cohort3, fig.width=10, fig.height=6}
+plot_alphadiver_curves(blue_curves_df) 
+```
+
+
+
+```{r}
+blue_curves_df <- blue_curves_df %>%
+  left_join(blueBL_smp %>%
+              select(SampleID, adherence.changeFromBL, adherence.pct), 
+            by = c("SampleID"))
+```
+
+```{r phylocurves-blue-bl-reduction-cohort3, fig.width=10, fig.height=6}
+plot_alphadiver_curves(blue_curves_df, color = "adherence.changeFromBL") +
+  scale_color_viridis(option = "inferno") 
+```
+
+```{r phylocurves-blue-bl-adherence-cohort3, fig.width=10, fig.height=6}
+plot_alphadiver_curves(blue_curves_df, color = "adherence.pct") +
+  scale_color_viridis() 
+```
+
+
+
+```{r phylocurves-blue-bl-age-cohort3, fig.width=10, fig.height=6}
+plot_alphadiver_curves(blue_curves_df, color = "Age") +
+  scale_color_viridis(option = "inferno", end = 0.85) 
+```
+
+```{r phylocurves-blue-bl-gender-cohort3, fig.width=10, fig.height=6}
+plot_alphadiver_curves(blue_curves_df, color = "Gender") +
+  scale_color_brewer(palette = "Set2") 
+```
+
+```{r alphadiv-blue-bl-cohort3, fig.width=7, fig.height=6}
+plot_alphadiver(blue_curves_df)
+```
+
+
+```{r}
+(blue_PD_summary_cohort3 <- blue_curves_df %>%
+   filter(floor(m) == 11000) %>%
+   group_by(Cat.12Mo) %>%
+   summarise(mean(pdrare), sd(pdrare)))
+  
+with(blue_curves_df %>%
+   filter(floor(m) == 11000), wilcox.test(
+  pdrare[Cat.12Mo == "US"], pdrare[Cat.12Mo == "VS"]))
+
+```
+
+
+
+### Low-Fat diet
+
+
+```{r}
+purpBL <- subset_samples(ps0, Timepoint == "Baseline" & Color == "Purple" & Cohort == 3)
+purpBL <- prune_taxa(taxa_sums(purpBL) > 0, purpBL)
+purpBL
+
+purpBL_cnts <- as(purpBL@otu_table, "matrix")
+purpBL_cnts <- data.frame(t(purpBL_cnts))
+purpBL_smp <- data.frame(purpBL@sam_data)
+```
+
+
+```{r}
+# purp_curves <- lapply(1:nsamples(purpBL), function(i) {
+#   cat("Sample no.", i, "\n")
+#   icounts <- purpBL_cnts[i, ]
+#   stepRare <- c(rarelevel1, seq(11000, sum(icounts), by = 1000))
+#   icurve <- phylocurve(icounts, purpBL@phy_tree, stepm = stepRare,
+#                        subsampling = "individual", replace = TRUE,
+#                        verbose = FALSE)
+#   df <- data.frame(m = icurve[, 1], pdrare = icurve[, 2],
+#                    pdvar = icurve[, 3], purpBL_smp[rep(i, nrow(icurve)), ])
+#   return(df)
+# })
+# purp_curves_df <- do.call("rbind", purp_curves)
+# save(list  = c("blue_curves_df", "purp_curves_df"), file = "diet_phylocurves_cohort3.rda")
+# saveRDS(purp_curves_df, file = "FINAL ANALYSIS/data/alphaDiversity/diet_phylocurves_purple_cohort3.rda")
+
+
+purp_curves_df <- readRDS("../data/alphaDiversity/diet_phylocurves_purple_cohort3.rda")
+```
+
+
+
+```{r phylocurves-purp-bl-per12-cohort3, fig.width=10, fig.height=6}
+plot_alphadiver_curves(purp_curves_df)
+```
+
+
+```{r}
+purp_curves_df <- purp_curves_df %>%
+  left_join(purpBL_smp %>%
+              select(SampleID, adherence.changeFromBL, adherence.pct), 
+            by = c("SampleID"))
+```
+
+```{r phylocurves-purp-bl-reduction-cohort3, fig.width=10, fig.height=6}
+plot_alphadiver_curves(purp_curves_df, color = "adherence.changeFromBL") +
+  scale_color_viridis(option = "inferno") 
+```
+
+```{r phylocurves-purp-bl-adherence-cohort3, fig.width=10, fig.height=6}
+plot_alphadiver_curves(purp_curves_df, color = "adherence.pct") +
+  scale_color_viridis() 
+```
+
+
+```{r phylocurves-purp-bl-age-cohort3, fig.width=10, fig.height=6}
+plot_alphadiver_curves(purp_curves_df, color = "Age") +
+  scale_color_viridis(option = "inferno", end = 0.85) 
+```
+
+```{r phylocurves-purp-bl-gender-cohort3, fig.width=10, fig.height=6}
+plot_alphadiver_curves(purp_curves_df, color = "Gender") +
+  scale_color_brewer(palette = "Set2") 
+```
+
+
+```{r alphadiv-purp-bl-cohort3, fig.width=7, fig.height=6}
+plot_alphadiver(purp_curves_df)
+```
+
+
+
+```{r}
+(purple_PD_summary_cohort3 <- purp_curves_df %>%
+   filter(floor(m) == 11000) %>%
+   group_by(Cat.12Mo) %>%
+   summarise(mean(pdrare), sd(pdrare)))
+  
+with(purp_curves_df %>%
+   filter(floor(m) == 11000), wilcox.test(
+  pdrare[Cat.12Mo == "US"], pdrare[Cat.12Mo == "VS"]))
+
+```
+
+
+
+
+
+
+
+```{r}
+sessionInfo()
+```

@@ -1,0 +1,313 @@
+---
+title: "Reads Identity Statistics"
+author:
+  - name: Lan Huong Nguyen
+    affiliation: Institute for Computational and Mathematical Engineering, Stanford University, CA 94305
+keywords: microbiome, gPCA, PCA, clustering, differential abundance.
+date: "`r BiocStyle::doc_date()`"
+output: 
+  html_notebook:
+    toc_float: true
+    df_print: paged
+vignette: >
+  %\VignetteIndexEntry{diet microbiome}
+  %\VignetteEngine{knitr::rmarkdown}
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE, warning = FALSE, message = FALSE, 
+  fig.align = 'center', fig.wide = TRUE, 
+  fig.width = 8, fig.height = 6
+)
+
+```
+
+# Set up
+
+```{r}
+.packages <- c("gridExtra","RColorBrewer", 
+               "tidyverse", "dplyr", "phyloseq")
+sapply(.packages, require, character.only = TRUE)
+
+options(stringsAsFactors = FALSE)
+```
+
+
+# Load data
+
+Raw reads statistics:
+
+```{r}
+main.dir <- "~/"
+path.to.dada2 <- file.path(main.dir, "/dada2PipelineRes/")
+readsfile <- file.path(path.to.dada2, "track/track_nochim_reads.csv")
+track.reads <- read.csv(readsfile, row.names = 1)
+tbl_df(track.reads)
+```
+
+```{r}
+sample.name <- gsub("(.*)\\_", "", track.reads$sample.id)
+particip.samples <- !is.na(as.numeric(sample.name))
+particip.reads <- colSums(track.reads[particip.samples, 4:ncol(track.reads)])/10^6
+particip.reads
+```
+
+```{r}
+percent.kept <- particip.reads/particip.reads[1]
+percent.kept
+```
+
+
+```{r}
+(ps0 <- readRDS("../data/phyloseq/diet_participants.rds"))
+```
+
+
+```{r}
+(pstips <- readRDS("../data/phyloseq/diet_participants_tipglom.rds"))
+```
+
+
+```{r}
+ps <- subset_samples(ps0, sample_sums(ps0) >= 10000)
+ps <- subset_samples(ps, !is.na(Cat.12Mo))
+ps <- subset_samples(ps, !(SubjectID == "1139" & Timepoint == "10 Week"))
+ps2 <- subset_samples(ps, Cohort == 2)
+ps3 <- subset_samples(ps, Cohort == 3)
+
+ps2
+ps3
+```
+
+```{r}
+table(sample_data(ps2)$Timepoint)
+table(sample_data(ps3)$Timepoint)
+
+```
+
+
+```{r}
+summary(sample_sums(ps2))
+sd(sample_sums(ps2))
+
+summary(sample_sums(ps3))
+sd(sample_sums(ps3))
+```
+
+
+
+## Collapsing repeated sequencing samples
+
+These statistics change after collapsing the replicated samples:
+
+Biological samples which were sequenced twice:
+
+```{r}
+(sample_data(ps) %>% 
+   group_by(Cohort, SampleID) %>% 
+   dplyr::summarise(
+     count = n(), 
+     meas = paste0(MeasID, collapse = "; ")
+     ) %>%
+   filter(count > 1))
+```
+
+```{r}
+new_smp_data <- sample_data(ps) %>%
+  data.frame() %>%
+  select(-Lane, -MeasID, -OrigSampleDepth) %>%
+  distinct() 
+rownames(new_smp_data) <- new_smp_data$SampleID
+
+dim(new_smp_data)
+```
+
+Combine repeated samples by computing the mean 
+
+```{r}
+collapse_samples <- function(physeq, sample_id = "SampleID", fun = mean){
+  sampledata_collapsed <- sample_data(physeq) %>%
+    select(-Lane, -MeasID, -OrigSampleDepth) %>%
+    distinct() 
+  rownames(sampledata_collapsed) <- sampledata_collapsed[[sample_id]]
+  seqtab <- data.frame(as(otu_table(physeq), "matrix"))
+  if(!taxa_are_rows(physeq)) seqtab <- t(seqtab)
+  
+  sample_ids <- physeq@sam_data[[sample_id]]
+  seqtab_collapsed <- sapply(unique(sample_ids), function(id){ 
+    if(sum(sample_ids == id) == 1) return(seqtab[, sample_ids == id])
+    apply(seqtab[, sample_ids == id], 1, fun)
+  })
+  rownames(seqtab_collapsed) <- rownames(seqtab)
+  physeq_collapsed <- phyloseq(
+    otu_table(seqtab_collapsed, taxa_are_rows = TRUE),
+    sample_data(sampledata_collapsed), 
+    tax_table(physeq), phy_tree(physeq))
+  return(physeq_collapsed)
+}
+
+ps.c <- collapse_samples(ps)
+```
+
+```{r}
+ps2.c <- subset_samples(ps.c, Cohort == 2)
+ps3.c <- subset_samples(ps.c, Cohort == 3)
+
+ps2.c
+ps3.c
+```
+
+```{r}
+summary(sample_sums(ps2.c))
+sd(sample_sums(ps2.c))
+
+summary(sample_sums(ps3.c))
+sd(sample_sums(ps3.c))
+```
+
+```{r}
+table(sample_data(ps2.c)$Timepoint)
+table(sample_data(ps3.c)$Timepoint)
+
+```
+
+
+# Seq clusters bp-Identity
+
+
+```{r}
+taxtable <- data.frame(ps@tax_table)  
+taxtabTips <- data.frame(pstips@tax_table)
+```
+
+```{r}
+head(taxtabTips)
+```
+
+```{r}
+table(sapply(taxtable$Seq, nchar))
+```
+
+```{r}
+library(stringdist)
+
+read_agreement <- function(taxtable, taxtabTips){
+  taxtable <- data.frame(taxtable)  
+  taxtabTips <- data.frame(taxtabTips)
+  
+  tip_seqs_names <- strsplit(taxtabTips$SeqIncluded , "/")
+  
+  tip_seqs_bp <- lapply(tip_seqs_names, function(seqs) 
+    taxtable[seqs, "Seq"])
+  
+  tip_seq_count <- sapply(tip_seqs_bp, length)
+  names(tip_seqs_bp) <- rownames(taxtabTips)
+  
+  tip_seqs_bp <- tip_seqs_bp[tip_seq_count > 1]
+  
+  tip_dist_lst <- lapply(tip_seqs_bp, function(i_tip) {
+    i_dist_df <- expand.grid(
+      seq1_idx = seq_along(i_tip), 
+      seq2_idx = seq_along(i_tip)
+      ) %>%
+      filter(seq1_idx < seq2_idx) 
+  
+    i_dist_df$bp_diff <- mapply(
+      stringdist::stringdist,
+      i_tip[i_dist_df$seq1_idx],
+      i_tip[i_dist_df$seq2_idx],
+      MoreArgs = list(method = "lv") # "lcs"
+    )
+    i_dist_df$percent_agreement <- (233 -i_dist_df$bp_diff)/233
+    return(i_dist_df)
+  })
+}
+
+
+```
+
+```{r}
+tips_seq_agreement_h1 <- read_agreement(ps@tax_table, pstips@tax_table)
+median_tip_dist_h1 <- sapply(tips_seq_agreement_h1, function(x) 
+  median(x$bp_diff))
+summary(median_tip_dist_h1)
+```
+
+```{r}
+median_tip_agreement_h1 <- sapply(tips_seq_agreement_h1, function(x) 
+  median(x$percent_agreement))
+summary(median_tip_agreement_h1)
+```
+
+
+```{r}
+ps.list <- readRDS("../data/phyloseq/listOfTipGlom_h0.05-h.9.rds")
+ps.h.05 <- ps.list[[1]]
+ps.h.1 <- ps.list[[2]]
+ps.h.25 <- ps.list[[3]]
+ps.h.5 <- ps.list[[4]]
+ps.h.9 <- ps.list[[5]]
+```
+
+```{r}
+tips_seq_agreement_h05 <- read_agreement(ps@tax_table, ps.h.05@tax_table)
+```
+
+
+```{r}
+median_tip_dist_h05 <- sapply(tips_seq_agreement_h05, function(x) 
+  median(x$bp_diff))
+summary(median_tip_dist_h05)
+```
+
+```{r}
+median_tip_agreement_h05 <- sapply(tips_seq_agreement_h05, function(x) 
+  median(x$percent_agreement))
+summary(median_tip_agreement_h05)
+```
+
+
+```{r}
+tips_seq_agreement_h25 <- read_agreement(ps@tax_table, ps.h.25@tax_table)
+
+median_tip_dist_h25 <- sapply(tips_seq_agreement_h25, function(x) 
+  median(x$bp_diff))
+summary(median_tip_dist_h25)
+```
+
+```{r}
+median_tip_agreement_h25 <- sapply(tips_seq_agreement_h25, function(x) 
+  median(x$percent_agreement))
+summary(median_tip_agreement_h25)
+```
+
+
+```{r}
+tips_seq_agreement_h5 <- read_agreement(ps@tax_table, ps.h.5@tax_table)
+median_tip_dist_h5 <- sapply(tips_seq_agreement_h5, function(x) 
+  median(x$bp_diff))
+```
+
+```{r}
+summary(median_tip_dist_h5)
+   # Min. 1st Qu.  Median    Mean 3rd Qu.    Max. 
+   # 1.00   17.00   27.00   24.45   32.25   45.00 
+```
+
+
+```{r}
+median_tip_agreement_h5 <- sapply(tips_seq_agreement_h5, function(x) 
+  median(x$percent_agreement))
+summary(median_tip_agreement_h5)
+ #   Min. 1st Qu.  Median    Mean 3rd Qu.    Max. 
+ # 0.8069  0.8616  0.8841  0.8951  0.9270  0.9957 
+```
+
+
+
+```{r}
+
+```
+

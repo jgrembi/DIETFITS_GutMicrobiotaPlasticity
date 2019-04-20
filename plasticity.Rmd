@@ -1,0 +1,1201 @@
+---
+title: "Plasticity and adherence"
+author: "Jess Grembi"
+date: "11/9/2018"
+output: 
+  BiocStyle::html_document:
+      number_sections: no
+      toc: yes
+      toc_float: yes
+---
+
+
+# Setup
+
+```{r setup}
+#rm(list = ls())
+
+.packages <- c("gridExtra", "ggplot2", "viridis",  "RColorBrewer", 
+               "knitr",  "phyloseq", "tidyverse", "ggsignif", "ggbeeswarm")
+sapply(.packages, require, character.only = TRUE)
+
+options(stringsAsFactors = FALSE)
+knitr::opts_chunk$set(
+  echo = TRUE, warning = FALSE, message = FALSE, 
+  fig.path = "../figs/plasticity/", dev= c('png', 'pdf'),
+  fig.align = 'center', fig.wide = TRUE, 
+  fig.width = 10, fig.height = 8
+)
+
+
+theme_set(theme_bw())
+theme_update(
+  text = element_text(size = 20),
+  strip.background = element_rect(fill="grey97")
+)
+```
+
+
+
+## Load data
+
+```{r}
+(ps0 <- readRDS("../data/phyloseq/diet_participants_with_adherence.rds"))
+
+# calculate adherence, and Subj_Group variables
+newSam_data <- sample_data(ps0) %>%
+  data.frame() %>%
+  mutate_at(vars(starts_with("adherence")), as.numeric) %>%
+  mutate(adherence.raw = rowMeans(select(., adherence_3_months, adherence_6_months, adherence_12_months), na.rm = T),
+         adherence.pct = 100-adherence.raw, 
+         adherence.changeFromBL = adherence_baseline - adherence.raw,
+         Subj_Group = factor(paste0(SubjectID, "_", Timepoint)), 
+         rowname = MeasID) %>%
+  column_to_rownames("rowname")
+
+
+sample_data(ps0) <- newSam_data
+
+```
+
+
+## Filter out samples with insufficient reads or no weight-loss data at 12 months
+
+```{r}
+minSampleDepth <- 10000
+
+
+(ps0 <- subset_samples(ps0, sample_sums(ps0) > minSampleDepth))
+(ps0 <- subset_samples(ps0, !(SubjectID == "1139" & Timepoint == "10 Week")))
+(ps0 <- subset_samples(ps0, !is.na(Cat.12Mo)))
+ps0 <- subset_taxa(ps0, taxa_sums(ps0) > 0)
+
+```
+
+## Twice-sequenced samples
+
+Find biological samples which were sequenced twice:
+
+```{r}
+(sample_data(ps0) %>% 
+   group_by(SampleID) %>% 
+   dplyr::summarise(
+     count = n(), 
+     meas = paste0(MeasID, collapse = "; ")
+     ) %>%
+   filter(count > 1))
+
+```
+
+
+Combine repeated samples by computing the mean 
+
+```{r}
+collapse_samples <- function(physeq, sample_id = "SampleID", fun = mean){
+  sampledata_collapsed <- sample_data(physeq) %>%
+    dplyr::select(-Lane, -MeasID, -OrigSampleDepth) %>%
+    distinct() 
+  rownames(sampledata_collapsed) <- sampledata_collapsed[[sample_id]]
+  seqtab <- data.frame(as(otu_table(physeq), "matrix"))
+  if(!taxa_are_rows(physeq)) seqtab <- t(seqtab)
+  
+  sample_ids <- physeq@sam_data[[sample_id]]
+  seqtab_collapsed <- sapply(unique(sample_ids), function(id){ 
+    if(sum(sample_ids == id) == 1) return(seqtab[, sample_ids == id])
+    apply(seqtab[, sample_ids == id], 1, fun)
+  })
+  rownames(seqtab_collapsed) <- rownames(seqtab)
+  physeq_collapsed <- phyloseq(
+    otu_table(seqtab_collapsed, taxa_are_rows = TRUE),
+    sample_data(sampledata_collapsed), 
+    tax_table(physeq), phy_tree(physeq))
+  return(physeq_collapsed)
+}
+```
+
+
+
+```{r}
+ps0 <- collapse_samples(ps0)
+ps0
+sample_data(ps0)$Cat.12Mo <- 
+  factor(sample_data(ps0)$Cat.12Mo, levels = c("US", "MS", "VS"))
+```
+
+
+
+# Plasticity/Variability compared to weight loss
+
+```{r}
+### Function to calculate beta diversity
+## Modified from Lan's original code to allow all comparisons to be made at once.  Then we can filter later
+beta_diversity <- function(physeq, timediff_thresh = 5,
+                           sample_info_cols = c("Diet", "Cat.12Mo", "SampleDate", "Percent.12Mo", "Timepoint", "adherence.pct", "adherence.changeFromBL", "Gender"),
+                           asinh = TRUE, metric = "bray") {
+  physeq <- phyloseq::prune_taxa(taxa_sums(physeq) > 0, physeq)
+  X <- as(otu_table(physeq), "matrix")
+  if(taxa_are_rows(physeq)) X <- t(X)
+  if(asinh) {
+    X <- asinh(X)
+    physeq <- phyloseq::phyloseq(
+      otu_table(X, taxa_are_rows = FALSE),
+      sample_data(physeq), phy_tree(physeq))
+  }
+  smp_df <- sample_data(physeq) %>%
+    data.frame() %>%
+    dplyr::select("SampleID", "SubjectID", sample_info_cols) %>%
+    mutate_at(
+      .funs = as.character, 
+      .vars = c("SampleID", "SubjectID")
+    )
+  if (metric == "jaccard") {
+    D <- dist(floor(X), method = "binary")
+  } else if (metric == "jsd") {
+    D <- phyloseq::distance(physeq, method = "jsd")
+  } else if (metric %in% c("unifrac", "wunifrac")) {
+    D <- UniFrac(physeq, weighted = ifelse(metric == "wunifrac", TRUE, FALSE))
+  } else {
+    D <- vegan::vegdist(X, method = metric)
+  }
+  df_dist <- reshape2::melt(
+    as.matrix(D), 
+    varnames = c("S1", "S2"),
+    value.name = "dist") %>%
+    mutate(
+      S1 = factor(S1, levels = smp_df$SampleID, ordered = TRUE), 
+      S2 = factor(S2, levels = smp_df$SampleID, ordered = TRUE)) %>%
+    filter(S1 < S2) %>%
+    mutate(
+      S1 = as.character(S1),
+      S2 = as.character(S2)) %>%
+    left_join(smp_df, by = c("S1" = "SampleID")) %>%
+    left_join(smp_df, by = c("S2" = "SampleID"),suffix = c("_1", "_2")) %>%
+    filter(SubjectID_1 == SubjectID_2) %>%
+    mutate(SubjectID = SubjectID_1) %>%
+    dplyr::select(-SubjectID_1, -SubjectID_2)
+    
+    if("SampleDate" %in% colnames(smp_df)) {
+      df_dist <- df_dist %>%
+        mutate(
+          SampleDate_1 = as.Date(SampleDate_1),
+          SampleDate_2 = as.Date(SampleDate_2),
+          TimeDiff = as.numeric(SampleDate_2 - SampleDate_1)
+        ) %>%
+        filter(abs(TimeDiff) <= timediff_thresh) %>%
+        # group_by(SubjectID) %>%
+        # top_n(2, wt = -TimeDiff) %>%
+        as.data.frame()
+    }
+  
+    cols <- setdiff(sample_info_cols, c("SampleDate", "Timepoint"))
+
+    df_dist <- df_dist %>%
+      dplyr::rename_at(
+        .funs = function(x) {gsub("_1", "", x)},
+        .vars = paste0(cols, "_1"))
+    
+    df_dist <- df_dist %>%
+      dplyr::select(setdiff(colnames(df_dist), paste0(cols, "_2")))
+  return(df_dist)
+}
+
+```
+
+
+## Calculate beta diversity between all samples
+
+```{r, eval = FALSE}
+dist_lst <- c("jaccard", "unifrac", "jsd", "bray", "wunifrac")
+beta_diver_lst <- lapply(dist_lst, function(dist) {
+  beta_diversity(
+    physeq  = ps0,
+    metric = dist,
+    timediff_thresh = Inf,
+    asinh = TRUE)})
+names(beta_diver_lst) <- dist_lst
+saveRDS(beta_diver_lst, file = "../results/beta_diver.rds")
+```
+
+```{r}
+dist_lst <- c("jaccard", "unifrac", "jsd", "bray", "wunifrac")
+beta_diver_lst <- readRDS("../results/beta_diver.rds")
+```
+
+
+```{r}
+beta_diver_df <- plyr::ldply(
+  beta_diver_lst, function(df) df, .id = "metric") %>%
+  mutate(metric = factor(
+    metric, levels = dist_lst, 
+    labels = c("Jaccard", "UniFrac", "Jensen-Shannon", "Bray-Curtis",
+               "Weighted UniFrac")),
+    Cat.12Mo = factor(Cat.12Mo, levels = c("US", "MS", "VS"))) %>%
+  left_join(ps0@sam_data %>% 
+          dplyr::select(SubjectID, Cohort) %>% 
+          mutate(
+            SubjectID = as.character(SubjectID)) %>% 
+          filter(!duplicated(SubjectID)))
+```
+
+
+### Number of days between samples
+```{r}
+
+##Stats on # days between samples at same timepoint
+(TimeDiff.stats <- beta_diver_df %>% 
+  filter(Timepoint_1 == Timepoint_2) %>%
+  group_by(Timepoint_1, Cohort) %>%
+  summarise(medianTD = median(TimeDiff), pct.25 = quantile(TimeDiff, 0.25), 
+            pct.75 = quantile(TimeDiff, 0.75)))
+
+##Stats on # days between samples at BL and 10-weeks 
+(TimeDiff.stats <- beta_diver_df %>% 
+    filter(Cohort == 2, metric == "Jaccard") %>%
+    filter(Timepoint_1 != Timepoint_2) %>%
+    group_by(Diet) %>%
+    summarise(medianTD = median(abs(TimeDiff)), 
+              pct.25 = quantile(abs(TimeDiff), 0.25), 
+              pct.75 = quantile(abs(TimeDiff), 0.75), 
+              meanTD = mean(abs(TimeDiff)), 
+              sdTD = sd(abs(TimeDiff))))
+```
+
+Cohort 3 samples are not collected on consecutive days so assessing daily plsticity is not feasible. 
+In addition, no samples are available from 10-weeks so we are unable to assess plasticity between baseline and 10-weeks.
+
+##Daily baseline (pre-diet) variability
+Keeping only consecutive samples that are within 5 days of each other (a few subjects did not follow instructions and samples are farther apart!)
+
+```{r}
+beta_diver_df_bl <- beta_diver_df %>%
+  filter(Cohort == 2,
+         Timepoint_1 == Timepoint_2,
+         Timepoint_1 == "Baseline",
+         abs(TimeDiff) <= 5) %>%
+  group_by(SubjectID, metric) %>%
+  top_n(2, wt = -TimeDiff) 
+
+
+beta_diver_df_bl_subj <- beta_diver_df_bl %>%
+  data.frame() %>%
+  group_by(metric, SubjectID, Diet, Gender) %>%
+  dplyr::summarise(
+    dist = mean(dist),
+    Cat.12Mo = unique(Cat.12Mo), Percent.12Mo = unique(Percent.12Mo))
+```
+
+
+
+```{r}
+table(beta_diver_df_bl_subj$Diet, beta_diver_df_bl_subj$metric)
+```
+
+
+```{r short-term-var-diet-bl-seqs_SI, fig.width=6, fig.height=12}
+diet_cols <- c(brewer.pal(9, "Set1")[2], brewer.pal(9, "Set1")[5])
+ggplot(beta_diver_df_bl_subj) +
+  geom_boxplot(
+    aes(y = dist, x = Cat.12Mo, color = Diet)
+  ) +
+  geom_jitter(
+    data = beta_diver_df_bl,
+    aes(y = dist, x = Cat.12Mo),
+    width = 0.15,
+    height = 0,
+    color = "grey55", size = 1
+  ) +
+  geom_jitter(
+    aes(y = dist, x = Cat.12Mo, color = Diet),
+    width = 0.05, height = 0,
+    shape = 17, size = 3
+  ) +
+  stat_signif(
+    data = beta_diver_df_bl_subj, 
+    aes(y = dist, x = Cat.12Mo),
+    stat = "signif",
+    comparisons = list(c("VS", "US")),
+    test = "wilcox.test", 
+   # test.args = list(alternative = "greater"),
+    manual = FALSE,
+    margin_top = -.12 , 
+    map_signif_level = F, 
+    vjust = -0.1
+  ) +
+  facet_grid(metric ~ Diet, scales = "free") +
+  scale_color_manual(values =  diet_cols) +
+  labs(y = "Pre-diet daily microbiota plasticity", 
+       x = "12-month weight-loss success category") +
+  theme(legend.position="none")
+```
+
+
+```{r}
+wilcoxon_test <- lapply(unique(beta_diver_df_bl_subj$metric), function(m) {
+  df <- beta_diver_df_bl_subj %>%
+    filter(metric == m)
+  
+  wtest_lst <- lapply(unique(df$Diet), function(diet) {
+    diet_df <- df %>% filter(Diet == diet)
+    max_y = max(df$dist)
+    diet_wtest <- wilcox.test(
+      x = diet_df %>% filter(Cat.12Mo == "VS") %>% .[["dist"]], 
+      y = diet_df %>% filter(Cat.12Mo == "US") %>% .[["dist"]], 
+      alternative = "two.sided") 
+    diet_wtest <- broom::tidy(diet_wtest) %>%
+      mutate(max_y = max_y)
+  })
+  names(wtest_lst) <- unique(df$Diet)
+  wtest_df <- plyr::ldply(wtest_lst, function(df) df, .id = "Diet")
+})
+names(wilcoxon_test) <- unique(beta_diver_df_bl_subj$metric)
+wilcoxon_test <- plyr::ldply(wilcoxon_test, function(df) df, .id = "metric") %>%
+  mutate(xmin = "US", xmax = "VS", 
+         annotation = paste0("p=", signif(p.value,2)), y_position = max_y + 0.05)
+wilcoxon_test %>% arrange(Diet, metric)
+```
+
+```{r}
+spearman_corr <- beta_diver_df_bl_subj %>%
+  mutate(Percent.12Mo = as.numeric(Percent.12Mo)) %>%
+  group_by(Diet, metric) %>%
+  mutate(
+    rank_dist = rank(dist),
+    rank_weight_loss = rank(Percent.12Mo))
+
+spearman_corr %>%
+  summarise(spearman = cor(rank_weight_loss, rank_dist, method = "spearman"))
+
+```
+
+
+
+
+## Daily plasticity at 10-weeks
+Keeping only consecutive samples that are within 5 days of each other (a few subjects did not follow instructions and samples are farther apart!)
+
+```{r}
+beta_diver_df_10wk <- beta_diver_df %>%
+  filter(Cohort == 2,
+         Timepoint_1 == Timepoint_2,
+         Timepoint_1 == "10 Week",
+         abs(TimeDiff) <= 5) %>%
+  group_by(SubjectID, metric) %>%
+  top_n(2, wt = -TimeDiff) 
+
+
+beta_diver_df_10wk_subj <- beta_diver_df_10wk %>%
+  data.frame() %>%
+  group_by(metric, SubjectID, Diet) %>%
+  dplyr::summarise(
+    dist = mean(dist),
+    Cat.12Mo = unique(Cat.12Mo), Percent.12Mo = unique(Percent.12Mo))
+```
+
+
+```{r}
+table(beta_diver_df_10wk_subj$Diet, beta_diver_df_10wk_subj$metric)
+```
+
+
+```{r short-term-var-10week-diet-seqs, fig.width=6, fig.height=12}
+ggplot(beta_diver_df_10wk_subj) +
+  geom_boxplot(
+    aes(y = dist, x = Cat.12Mo, color = Diet)
+  ) +
+  geom_jitter(
+    data = beta_diver_df_10wk,
+    width = 0.15, height = 0,
+    aes(y = dist, x = Cat.12Mo),
+    color = "grey55", size = 1
+  ) +
+  geom_jitter(
+    aes(y = dist, x = Cat.12Mo, color = Diet),
+    width = 0.05, height = 0,
+    shape = 17, size = 3
+  ) +
+  stat_signif(
+    data = beta_diver_df_10wk_subj, 
+    aes(y = dist, x = Cat.12Mo),
+    stat = "signif", 
+    comparisons = list(c("VS", "US")), 
+    test = "wilcox.test", 
+   # test.args = list(alternative = "greater"), 
+    manual = FALSE, 
+    margin_top = -.12 , 
+    map_signif_level = FALSE, 
+    vjust = -0.1
+  ) + 
+  facet_grid(metric ~ Diet, scales = "free") +
+  scale_color_manual(values =  diet_cols) + 
+  labs(y = "10-week daily plasticity",
+       x = "12-month weight loss success category") + 
+  theme(legend.position="none")
+
+```
+
+
+## Plasticity from pre-diet to 10 weeks
+
+```{r}
+beta_diver_df_longTerm <- beta_diver_df %>%
+  filter(Cohort == 2, Timepoint_1 != Timepoint_2) 
+
+
+beta_diver_df_longTerm_subj <- beta_diver_df_longTerm %>%
+  group_by(metric, SubjectID, Diet, Cat.12Mo,Percent.12Mo) %>%
+  dplyr::summarise(dist = mean(dist)) 
+```
+
+
+```{r}
+table(beta_diver_df_longTerm_subj$Diet, beta_diver_df_longTerm_subj$metric)
+```
+
+
+```{r long-term-var-diet-seqs_pairwise, fig.height=12, fig.width=6}
+ggplot(data = beta_diver_df_longTerm_subj) +
+  geom_boxplot(
+    aes(y = dist, x = Cat.12Mo, color = Diet)
+  ) +
+  geom_jitter(
+    data = beta_diver_df_longTerm,
+    width = 0.15, height = 0,
+    aes(y = dist, x = Cat.12Mo),
+    color = "grey55", size = 1
+  ) +
+  geom_jitter(
+    aes(y = dist, x = Cat.12Mo, color = Diet),
+    width = 0.05, height = 0,
+    shape = 17, size = 3
+  ) +
+  stat_signif(
+    data = beta_diver_df_longTerm_subj, 
+    aes(y = dist, x = Cat.12Mo),
+    stat = "signif", 
+    comparisons = list(c("VS", "US")), 
+    test = "wilcox.test", 
+   # test.args = list(alternative = "greater"), 
+    manual = FALSE, 
+    margin_top = -.12 , 
+    map_signif_level = FALSE, 
+    vjust = -0.1
+  ) + 
+  facet_grid( metric ~ Diet, scales = "free") +
+  scale_color_manual(values = diet_cols) + 
+  labs(y = "Microbiota plasticity between pre-diet and 10-weeks", 
+       x = "12-month weight loss success category") + 
+  theme(legend.position="none")
+  
+```
+
+
+
+```{r}
+wilcoxon_test <- lapply(unique(beta_diver_df_longTerm_subj$metric), function(m) {
+  df <- beta_diver_df_longTerm_subj %>%
+    filter(metric == m)
+  
+  wtest_lst <- lapply(unique(df$Diet), function(diet) {
+    diet_df <- df %>% filter(Diet == diet)
+    diet_wtest <- wilcox.test(
+      x = diet_df %>% filter(Cat.12Mo == "VS") %>% .[["dist"]], 
+      y = diet_df %>% filter(Cat.12Mo == "US") %>% .[["dist"]], 
+      alternative = "two.sided") 
+    diet_wtest <- broom::tidy(diet_wtest)
+  })
+  names(wtest_lst) <- unique(df$Diet)
+  wtest_df <- plyr::ldply(wtest_lst, function(df) df, .id = "Diet")
+})
+names(wilcoxon_test) <- unique(beta_diver_df_longTerm_subj$metric)
+wilcoxon_test <- plyr::ldply(wilcoxon_test, function(df) df, .id = "metric")
+wilcoxon_test %>% arrange(Diet, metric)
+```
+
+
+```{r}
+spearman_corr <- beta_diver_df_longTerm_subj %>%
+  mutate(Percent.12Mo = as.numeric(Percent.12Mo)) %>%
+  group_by(Diet, metric) %>%
+  dplyr::summarise(spearman = cor(Percent.12Mo, dist, method = "spearman"),
+                   pearson = cor(Percent.12Mo, dist, method = "pearson"))
+spearman_corr
+```
+
+
+```{r}
+beta_diver_df_bl <- beta_diver_df %>%
+  filter(Cohort == 2,
+         Timepoint_1 == Timepoint_2,
+         Timepoint_1 == "Baseline",
+         abs(TimeDiff) <= 5) %>%
+  group_by(SubjectID, metric) %>%
+  top_n(2, wt = -TimeDiff) 
+```
+
+## Comparison of Microbiota plasticity across all time points
+
+
+```{r}
+beta_diver_df <- beta_diver_df %>%
+  filter(
+    Cohort == 2,
+    !(Timepoint_1 == Timepoint_2 & TimeDiff > 5 )) %>%
+  mutate(VarCat = factor(
+    ifelse(Timepoint_1 == Timepoint_2,
+          ifelse(Timepoint_1 == "Baseline", "BL v. BL", "10wk v. 10wk"), 
+          "BL v. 10wk"), 
+  levels = c( "BL v. BL", "10wk v. 10wk", "BL v. 10wk"))) 
+
+
+beta_diver_df <- rbind(
+  data.frame(beta_diver_df %>% filter(VarCat != "BL v. 10wk") %>%
+     group_by(SubjectID, metric, VarCat) %>%
+     top_n(2, wt = -TimeDiff)), # pick only distances from (A,B) and (B, C) and NOT (A,C) 
+                               # when evaluating  "BL v. BL", "10wk v. 10wk"
+  data.frame(beta_diver_df %>% filter(VarCat == "BL v. 10wk"))
+)
+
+ 
+
+beta_diver_df_bySubj <- beta_diver_df %>%
+  group_by(SubjectID, Gender, Diet, VarCat, metric) %>%
+  dplyr::summarise(
+    dist = mean(dist), meanTimeDiff = mean(TimeDiff),
+    medianTimeDiff = median(TimeDiff),
+    Cat.12Mo = unique(Cat.12Mo), 
+    Percent.12Mo = unique(Percent.12Mo),
+    adherence.pct = unique(adherence.pct),
+    adherence.changeFromBL = unique(adherence.changeFromBL))
+
+(beta_diver_Summary <- beta_diver_df_bySubj %>%
+  filter(metric == "Bray-Curtis") %>%
+  group_by(Diet, VarCat) %>%
+  dplyr::summarise(meanTD = mean(meanTimeDiff), 
+                   medianTD = median(meanTimeDiff)))
+
+```
+
+```{r variability_acrossAllTimes-facet, fig.height=8, fig.width=12}
+ggplot(
+  data = beta_diver_df_bySubj %>% 
+    filter(metric %in% c("Bray-Curtis")) %>%
+    ungroup() %>%
+    mutate(
+      VarCat = factor(VarCat, levels = c("BL v. 10wk", "10wk v. 10wk", "BL v. BL"))), 
+  aes(x = Cat.12Mo, y = dist)
+  ) + 
+  geom_boxplot(
+    aes(color = Cat.12Mo),
+    outlier.shape = NA
+  ) + 
+  geom_point(
+    data = beta_diver_df %>% filter(metric %in% c("Bray-Curtis")), 
+    aes( x = Cat.12Mo, y = dist, fill = Cat.12Mo), 
+    position = position_jitterdodge(jitter.width = 0.5), 
+    color = "grey55", 
+    size = 1.5, 
+    alpha = 0.5, 
+    show.legend=FALSE
+  ) + 
+  geom_point(
+    aes(color = Cat.12Mo),
+    position = position_jitterdodge(jitter.width = 0.3), 
+    shape = 17, 
+    size = 3
+  ) +
+  stat_signif(
+    stat = "signif",
+    label = "p.adj",
+    comparisons = list(c("VS", "US")),
+    test = "wilcox.test",
+    margin_top = -.12 ,
+    vjust = -0.5
+  ) +
+  facet_grid(VarCat ~ Diet) + 
+  scale_color_manual(values = c("#E41A1C", "#377EB8", "#4DAF4A")) + 
+  labs(x = " ", y = "Bray-Curtis dissimilarity", color = "") + 
+  coord_flip() + 
+  guides(color = guide_legend(reverse=T, title = "Weight Loss Success")) +
+  theme(text = element_text(size = 20), legend.position = "top")
+
+```
+
+The ones below are probably adjusted p-values
+
+
+```{r variability_acrossAllTimes, fig.height=6, fig.width=12}
+library(ggpubr)
+ggplot(
+  data = beta_diver_df_bySubj %>% 
+    filter(metric == "Bray-Curtis"), 
+  aes(x = VarCat, y = dist)
+  ) + 
+  geom_boxplot(
+    aes(color = Cat.12Mo),
+    outlier.shape = NA
+  ) + 
+  geom_point(
+    data = beta_diver_df %>% filter(metric == "Bray-Curtis"), 
+    aes(x = VarCat, y = dist, lty = Cat.12Mo), 
+    position = position_jitterdodge(jitter.width = 0.25), 
+    color = "grey70", size = 1.5, alpha = 0.5
+  ) + 
+  geom_point(
+    aes(color = Cat.12Mo),
+    position = position_jitterdodge(jitter.width = 0.1), 
+    shape = 17, size = 3
+  ) +
+  stat_compare_means(
+    data = beta_diver_df_bySubj %>%
+      filter(metric %in% c("Bray-Curtis"), Cat.12Mo != "MS"),
+    mapping = aes(x = VarCat, y = dist, group = Cat.12Mo), 
+    size = 6,
+    label.y.npc = 0.75, 
+    label = "p.format", 
+    method = "wilcox.test", 
+    method.args = list(alternative = "two.sided"),
+    tip.length = 0.05,
+    inherit.aes = FALSE) +
+  # stat_signif(
+  #   stat = "signif",
+  #   label = "p.adj",
+  #   comparisons = list(c("VS", "US")),
+  #   test = "wilcox.test",
+  #   margin_top = -.12 ,
+  #   vjust = -0.5
+  # ) +
+  facet_grid(~Diet, scales = "free") +
+  scale_color_manual(values = c("#E41A1C", "#377EB8", "#4DAF4A")) + 
+  labs(x = " ", y = "Bray-Curtis dissimilarity", color = "") + 
+  coord_flip() + 
+  guides(color = guide_legend(reverse=T, title = "Weight Loss Success")) +
+  theme(text = element_text(size = 25), legend.position = "top")
+```
+
+
+No difference in Microbiota plasticity between men and women at any time point (BL v BL, 10wk v 10wk, or BL v 10wk). 
+
+Also looked by diet and differences between men and women by diet were also insignificant at each time point.
+
+```{r, fig.height=6, fig.width=10}
+
+ggplot(beta_diver_df_bySubj, 
+       aes(x = Gender, y = dist)
+) + 
+  geom_boxplot() + 
+  stat_signif(stat = "signif",
+              comparisons = list(c("Male", "Female")),
+              test = "wilcox.test", 
+              test.args = list(alternative = "two.sided"),
+              manual = FALSE,
+              margin_top = -.12 , map_signif_level = FALSE, vjust = -0.1
+  ) +
+  facet_wrap(VarCat~metric, scales = "free_y", ncol = 5) + 
+  labs(x = "", y = "Microbiota plasticity")
+
+
+```
+
+Is Pre-diet/baseline plasticity (BL v BL) correlated to plasticity over 10 weeks (BL v 10wk)?
+
+```{r, fig.height=6, fig.width=10}
+
+beta_diver_df_bySubj_wide <- beta_diver_df_bySubj %>%
+  select(-meanTimeDiff, -medianTimeDiff) %>%
+  reshape2::dcast(SubjectID + metric + adherence.pct + adherence.changeFromBL + Diet + Cat.12Mo ~ VarCat, value.var = "dist") %>%
+  rename(plas.BL = `BL v. BL`,
+         plas.10wk = `10wk v. 10wk`, 
+         plas.BL_10wk = `BL v. 10wk`)
+
+
+
+ggplot(data = beta_diver_df_bySubj_wide, aes( x = plas.BL, y = plas.BL_10wk)) + 
+  geom_point(aes(color = Cat.12Mo), size = 3) + 
+  ggpubr::stat_cor(method = "spearman") +
+  facet_wrap(Diet~metric, ncol = 5) + 
+  labs(x = "BL plasticity", y = "BL-->10wk plasticity", color = "") + 
+  stat_smooth(method = "lm") + coord_fixed(ratio = 1)
+
+
+
+ggplot(data = beta_diver_df_bySubj_wide, aes( x = plas.BL, y = plas.10wk)) + 
+  geom_point(aes(color = Cat.12Mo), size = 3) + 
+  ggpubr::stat_cor(method = "spearman") +
+  facet_wrap(Diet~metric, ncol = 5) + 
+  labs(x = "BL plasticity", y = "10wk plasticity", color = "") + 
+  stat_smooth(method = "lm") + coord_fixed(ratio = 1)
+
+
+ggplot(data = beta_diver_df_bySubj_wide, aes( x = plas.10wk, y = plas.BL_10wk)) + 
+  geom_point(aes(color = Cat.12Mo), size = 3) + 
+  ggpubr::stat_cor(method = "spearman") +
+  facet_wrap(Diet~metric, ncol = 5) + 
+  labs(x = "10wk plasticity", y = "BL-->10wk plasticity", color = "") + 
+  stat_smooth(method = "lm") + coord_fixed(ratio = 1)
+```
+
+
+
+### Microbiota plasticity vs alpha-diversity
+
+```{r}
+blue_curves_df <- readRDS("../data/alphaDiversity/diet_phylocurves_blue_cohort2.rda")
+purp_curves_df <- readRDS("../data/alphaDiversity/diet_phylocurves_purple_cohort2.rda")
+
+alphadiver_cohort2 <- bind_rows(blue_curves_df, purp_curves_df) %>%
+  filter(floor(m) == 11000)
+```
+
+
+```{r alpha-vs-beta-diversity, fig.width=12, fig.height=5}
+alphadiver_cohort2_subj <- alphadiver_cohort2 %>%
+  group_by(SubjectID) %>%
+  dplyr::summarise(mean_alpha_diversity = mean(pdrare))
+
+df_alpha_beta <- beta_diver_df_bl_subj %>%
+  left_join(alphadiver_cohort2_subj) 
+
+ggplot(df_alpha_beta, 
+       aes(x = mean_alpha_diversity, y = dist)) +
+  geom_point(size = 3) +
+  geom_smooth(method = "lm") +
+  ggpubr::stat_cor(method = "spearman") + 
+  facet_wrap(~metric, scales = "free", ncol = 6) + 
+  labs(x = "Mean alpha diversity", y = "Pre-diet daily plasticity")
+```
+
+
+```{r alpha-vs-beta-diversity-diet, fig.width=12, fig.height=7}
+ggplot(df_alpha_beta, 
+       aes(x = mean_alpha_diversity, y = dist)) +
+  geom_point(size = 3) +
+  geom_smooth(method = "lm") +
+  ggpubr::stat_cor(method = "spearman") + 
+  facet_wrap(~ Diet +  metric, scales = "free", ncol = 5) + 
+  labs(x = "Mean alpha diversity", y = "Pre-diet daily plasticity")
+```
+
+
+# Microbiota plasticity compared to adherence/dietary fidelity
+
+## Adherence/dietary fidelity v weight loss
+```{r adherence_plots, fig.height=4, fig.width = 8}
+ggplot(beta_diver_df_bySubj, 
+       aes(x = Percent.12Mo, y = adherence.changeFromBL, color = Gender)
+) + 
+  geom_point() + 
+  stat_smooth(method = "lm") + 
+  facet_wrap(~Diet) + 
+  ggpubr::stat_cor(method = "pearson") + 
+  labs(y = "Dietary compliance (change from BL)", x = "12-month weight loss (%)")
+
+```
+
+
+##Microbiota plasticity v. adherence/dietary fidelity 
+
+Pre-diet daily plasticity v adherence/dietary fidelity 
+
+
+```{r adherence-plasticity-MainFig, fig.height=6, fig.width=8}
+gender_cols <- c("Female" = "#74D055FF", 
+                  "Male" = brewer.pal(8, "Dark2")[3])
+ggplot(beta_diver_df_bySubj %>% 
+         filter(VarCat %in% c("BL v. BL", "BL v. 10wk"),
+           metric %in% c("Bray-Curtis")),
+       aes(y = dist, x = adherence.changeFromBL, 
+           group = Gender, color= Gender, fill = Gender, 
+           lty = Gender)) +
+  geom_smooth(method = "lm", lwd = 1.5, alpha = 0.25) +
+  geom_point(size = 3, color = "grey50", pch = 21) + 
+  ggpubr::stat_cor(method = "spearman") + 
+  facet_grid(VarCat ~ Diet, scale ="free") +
+  labs(x = "Dietary compliance", 
+       y = "Microbiota plasticity", 
+       color = "Gender") +
+  scale_linetype_manual(values = c(2, 1)) +
+  scale_color_manual(values = gender_cols) + 
+  scale_fill_manual(values = gender_cols) + 
+  theme(legend.position = "top", text = element_text(size = 20))
+```
+
+```{r adherence-plasticity-SexTogether, fig.height=6, fig.width=8}
+#Not separated by gender
+ggplot(beta_diver_df_bySubj %>% 
+         filter(VarCat %in% c("BL v. BL", "BL v. 10wk"),
+           metric %in% c("Bray-Curtis")),
+       aes(y = dist, x = adherence.changeFromBL)) +
+  geom_smooth(method = "lm", lwd = 1.5, alpha = 0.25) +
+  geom_point(size = 3, color = "grey50", pch = 21) + 
+  ggpubr::stat_cor(method = "spearman") + 
+  facet_grid(VarCat ~ Diet, scale ="free") +
+  labs(x = "Dietary compliance", 
+       y = "Microbiota plasticity") +
+  scale_linetype_manual(values = c(2, 1)) +
+  # scale_color_manual(values = gender_cols) + 
+  # scale_fill_manual(values = gender_cols) + 
+  theme(legend.position = "top", text = element_text(size = 20))
+
+```
+
+
+
+
+```{r adherence-plasticity-bl-SI, fig.height=12, fig.width=6}
+ggplot(beta_diver_df_bySubj %>% 
+         filter(VarCat == "BL v. BL"),
+       aes(y = dist, x = adherence.changeFromBL, group = Gender, 
+           color= Gender, fill = Gender, lty = Gender)) +
+  geom_smooth(method = "lm", lwd = 1.5, alpha = 0.25) +
+  geom_point(size = 3, color = "grey50", pch = 21) + 
+  ggpubr::stat_cor(method = "spearman") + 
+  facet_grid(metric ~ Diet, scale = "free") +
+  labs(x = "Dietary compliance", 
+       y = "Pre-diet microbiota plasticity", 
+       color = "Gender") +
+  scale_linetype_manual(values = c(2, 1)) +
+  scale_color_manual(values = gender_cols) + 
+  scale_fill_manual(values = gender_cols) + 
+  theme(legend.position = "top", text = element_text(size = 20))
+```
+
+
+
+### Pre-diet to 10-week plasticity v adherence/dietary fidelity 
+
+```{r adherence-plasticity-bl_10wk_SI, fig.height=12, fig.width=6}
+ggplot(beta_diver_df_bySubj %>% 
+         filter(
+           VarCat == "BL v. 10wk"),
+       aes(y = dist, x = adherence.changeFromBL, group = Gender, 
+           color= Gender, fill = Gender, lty = Gender)) +
+  geom_smooth(method = "lm", lwd = 1.5, alpha = 0.25) +
+  geom_point(size = 3, color = "grey50", pch = 21) + 
+  ggpubr::stat_cor(method = "spearman") + 
+  facet_grid(metric ~ Diet, scale = "free") +
+  labs(x = "Dietary compliance", 
+       y = "Microbiota plasticity between pre-diet and 10-weeks", 
+       color = "Gender") +
+  scale_linetype_manual(values = c(2, 1)) +
+  scale_color_manual(values = gender_cols) + 
+  scale_fill_manual(values = gender_cols) + 
+  theme(legend.position = "top", text = element_text(size = 20))
+```
+
+
+
+
+## Calculating variability on tip-agglomerated dataset
+
+## Load data
+
+```{r}
+(pstips <- readRDS("../data/phyloseq/diet_participants_tipglom_with_adherence.rds"))
+
+# calculate adherence, and Subj_Group variables
+newSam_data <- sample_data(pstips) %>%
+  data.frame() %>%
+  mutate_at(vars(starts_with("adherence")), as.numeric) %>%
+  mutate(adherence.raw = rowMeans(select(., adherence_3_months, adherence_6_months, adherence_12_months), na.rm = T),
+         adherence.pct = 100-adherence.raw, 
+         adherence.changeFromBL = adherence_baseline - adherence.raw,
+         Subj_Group = factor(paste0(SubjectID, "_", Timepoint)), 
+         rowname = MeasID, 
+         Cat.12Mo = factor(Cat.12Mo, levels = c("US", "MS", "VS"))) %>%
+  column_to_rownames("rowname")
+
+sample_data(pstips) <- newSam_data
+
+
+minSampleDepth <- 10000
+cohort         <- 2
+
+(pstips <- subset_samples(pstips, sample_sums(pstips) > minSampleDepth))
+(pstips <- subset_samples(pstips, Cohort == cohort))
+(pstips <- subset_samples(pstips, !(SubjectID == "1139" & Timepoint == "10 Week")))
+(pstips <- subset_samples(pstips, !is.na(Cat.12Mo)))
+
+(pstips <- subset_taxa(pstips, taxa_sums(pstips) > 0))
+
+```
+
+### Biological samples that were sequenced twice
+
+```{r}
+(sample_data(pstips) %>% 
+   group_by(SampleID) %>% 
+   summarise(
+     count = n(), 
+     meas = paste0(MeasID, collapse = "; ")
+     ) %>%
+   filter(count > 1))
+```
+
+Combine repeated samples by computing the mean 
+
+```{r}
+pstips <- collapse_samples(pstips)
+pstips
+```
+
+
+```{r, eval = FALSE}
+
+dist_lst <- c("jaccard", "unifrac", "jsd", "bray", "wunifrac")
+beta_diver_lst <- lapply(dist_lst, function(dist) 
+  beta_diversity(
+    physeq  = pstips,
+    metric = dist, 
+    timediff_thresh = 500,
+    asinh = TRUE))
+names(beta_diver_lst) <- dist_lst
+saveRDS(beta_diver_lst, file = "../results/beta_diver_tip_glom.rds")
+```
+
+```{r}
+beta_diver_lst <- readRDS("../results/beta_diver_tip_glom.rds")
+beta_diver_df <- plyr::ldply(beta_diver_lst, function(df) df, .id = "metric") %>%
+  mutate(metric = factor(metric, levels = dist_lst, labels = c("Jaccard", "UniFrac", "Jensen-Shannon", "Bray-Curtis", "Weighted UniFrac")),
+         Cat.12Mo = factor(Cat.12Mo, levels = c("US", "MS", "VS")))
+```
+
+##Daily baseline (pre-diet) variability
+Keeping only consecutive samples that are within 5 days of each other 
+
+
+```{r}
+beta_diver_df_bl <- beta_diver_df %>%
+  filter(Timepoint_1 == Timepoint_2,
+         Timepoint_1 == "Baseline",
+         abs(TimeDiff) <= 5) %>%
+  group_by(SubjectID, metric) %>%
+  top_n(2, wt = -TimeDiff) 
+
+
+beta_diver_df_bl_subj <- beta_diver_df_bl %>%
+  data.frame() %>%
+  group_by(metric, SubjectID, Diet, Gender) %>%
+  dplyr::summarise(
+    dist = mean(dist),
+    Cat.12Mo = unique(Cat.12Mo), Percent.12Mo = unique(Percent.12Mo))
+
+
+```
+
+```{r short-term-var-diet-tips, fig.height=12, fig.width=6}
+ggplot(beta_diver_df_bl_subj) +
+  geom_boxplot(
+    aes(y = dist, x = Cat.12Mo, color = Diet)
+  ) +
+  geom_jitter(
+    data = beta_diver_df_bl,
+    aes(y = dist, x = Cat.12Mo),
+    width = 0.1, 
+    height = 0,
+    color = "grey55", 
+    size = 1
+  ) +
+  geom_point(
+    aes(y = dist, x = Cat.12Mo, color = Diet),
+    shape = 17, 
+    size = 3
+  ) +
+  stat_signif(
+    data = beta_diver_df_bl_subj, 
+    aes(y = dist, x = Cat.12Mo),
+    stat = "signif",
+    comparisons = list(c("VS", "US")),
+    test = "wilcox.test", 
+#    test.args = list(alternative = "greater"),
+    manual = FALSE,
+    margin_top = -.12 , 
+    map_signif_level = F, 
+    vjust = -0.1
+  ) +
+  facet_grid(metric~Diet, scales = "free") +
+  scale_color_manual(values =  diet_cols) + 
+  labs(y = "Pre-diet daily plasticity", 
+       x = "12-month weight-loss success category") +
+  theme(legend.position="none")
+```
+
+## Microbiota plasticity from pre-diet to 10 weeks
+```{r}
+beta_diver_df_longTerm <- beta_diver_df %>%
+  filter(Timepoint_1 != Timepoint_2) 
+
+
+beta_diver_df_longTerm_subj <- beta_diver_df_longTerm %>%
+  group_by(metric, SubjectID, Diet, Cat.12Mo,Percent.12Mo) %>%
+  dplyr::summarise(dist = mean(dist))
+```
+
+
+```{r}
+table(beta_diver_df_longTerm_subj$Diet, beta_diver_df_longTerm_subj$metric)
+```
+
+
+```{r long-term-var-diet-tips_pairwise, fig.height=12, fig.width=6}
+ggplot(data = beta_diver_df_longTerm_subj) +
+  geom_boxplot(
+    aes(y = dist, x = Cat.12Mo, color = Diet)
+  ) +
+  geom_jitter(
+    data = beta_diver_df_longTerm,
+    width = 0.1, height = 0,
+    aes(y = dist, x = Cat.12Mo),
+    color = "grey55", size = 1
+  ) +
+  geom_beeswarm(
+    aes(y = dist, x = Cat.12Mo, color = Diet),
+    shape = 17, 
+    size = 3
+  ) +
+  stat_signif(
+    aes(y = dist, x = Cat.12Mo),
+    stat = "signif", 
+    comparisons = list(c("VS", "US")), 
+    test = "wilcox.test", 
+#    test.args = list(alternative = "greater"), 
+    manual = FALSE, 
+    margin_top = -.12 , 
+    map_signif_level = FALSE, 
+    vjust = -0.1
+  ) + 
+  facet_grid(metric~Diet, scales = "free") +
+  scale_color_manual(values =  diet_cols) + 
+  labs(y = "Microbiota plasticity between pre-diet and 10-weeks",
+       x = "12-month weight loss success category") + 
+  theme(legend.position="none")  
+  
+```
+ 
+
+## Comparison of plasticity across all time points
+
+```{r}
+beta_diver_df <- beta_diver_df %>%
+  mutate(
+    VarCat = factor(
+      ifelse(Timepoint_1 == Timepoint_2, 
+             ifelse(Timepoint_1 == "Baseline", "BL v. BL",
+                    "10wk v. 10wk"), "BL v. 10wk"),
+      levels = c("BL v. BL", "10wk v. 10wk", "BL v. 10wk"))) %>%
+  filter(!(Timepoint_1 == Timepoint_2 & TimeDiff >5))
+
+beta_diver_df_bySubj <- beta_diver_df %>%
+  group_by(SubjectID, Gender, Diet, VarCat, metric, Cat.12Mo, Percent.12Mo, adherence.pct, adherence.changeFromBL) %>%
+  dplyr::summarise(dist = mean(dist), meanTimeDiff = mean(TimeDiff), medianTimeDiff = median(TimeDiff))
+
+(beta_diver_Summary <- beta_diver_df_bySubj %>%
+  filter(metric == "Bray-Curtis") %>%
+  group_by(Diet, VarCat) %>%
+  dplyr::summarise(meanTD = mean(meanTimeDiff), medianTD = median(meanTimeDiff)))
+
+```
+
+
+```{r variability_acrossAllTimes-tip_glom, fig.height=5, fig.width=12}
+ggplot(
+  data = beta_diver_df_bySubj %>% filter(metric %in% c("Bray-Curtis")), 
+  aes(x = VarCat, y = dist)
+) + 
+  geom_boxplot(
+    aes(color = Cat.12Mo),
+    outlier.shape = NA
+  ) + 
+  geom_point(
+    data = beta_diver_df %>% filter(metric %in% c("Bray-Curtis")), 
+    aes( x = VarCat, y = dist, fill = Cat.12Mo), 
+    position = position_jitterdodge(jitter.width = 0.25), 
+    color = "grey55", size = 1.5, alpha = 0.5
+  ) + 
+  geom_point(
+    aes(color = Cat.12Mo),
+    position = position_jitterdodge(jitter.width = 0.1), 
+    shape = 17, size = 3
+  ) +
+  stat_compare_means(
+    data = beta_diver_df_bySubj %>% 
+      filter(metric %in% c("Bray-Curtis"), Cat.12Mo != "MS"),
+    mapping = aes(group = Cat.12Mo),
+    label.y.npc = 0.9) +
+  facet_wrap(~Diet, scales = "free", ncol = 2) + 
+  scale_color_manual(values = c("#E41A1C", "#377EB8", "#4DAF4A")) + 
+  labs(x = " ", y = "Bray-Curtis dissimilarity", color = "") + 
+  coord_flip() + 
+  guides(colour = guide_legend(reverse=T, title = "Weight Loss Success")) +
+  theme(text = element_text(size = 20), legend.position = "top")
+
+```
+
+
+
+# Microbiota plasticity compared to adherence/dietary fidelity
+
+##Microbiota plasticity v. adherence/dietary fidelity 
+
+```{r adherence-plasticity-bl-tip_glom, fig.height = 8, fig.width=7}
+ggplot(beta_diver_df_bySubj %>% 
+         filter(VarCat %in% c("BL v. BL", "BL v. 10wk"),
+           metric %in% c("Bray-Curtis")),
+       aes(x = dist, y = adherence.changeFromBL, group = Gender, 
+           color = Gender, fill = Gender, lty = Gender)) +
+  geom_smooth(method = "lm", lwd = 1.5, alpha = 0.25) +
+  geom_point(size = 3, color = "grey50", pch = 21) + 
+  ggpubr::stat_cor(aes(color = Gender), method = "spearman") + 
+  facet_wrap(VarCat ~ Diet) +
+  labs(y = "Dietary compliance", 
+       x = "Microbiota plasticity (Bray-Curtis dissimilarity)") +
+  scale_linetype_manual(values = c(2, 1)) +
+  scale_color_manual(values = gender_cols) + 
+  scale_fill_manual(values = gender_cols) + 
+  theme(legend.position = "top", text = element_text(size = 20))
+```
+
+
+
+
+```{r adherence-plasticity-bl-tip_glom_SI,fig.height=12, fig.width=6}
+ggplot(
+  beta_diver_df_bySubj %>% filter(VarCat == "BL v. BL"),
+  aes(y = dist, x = adherence.changeFromBL, group = Gender, 
+      color= Gender, fill = Gender, lty = Gender)) +  
+  geom_smooth(method = "lm", lwd = 1.5, alpha = 0.25) +
+  geom_point(size = 3, color = "grey50", pch = 21) + 
+  ggpubr::stat_cor(method = "spearman") + 
+  facet_grid(metric ~ Diet, scales = "free") +  
+  labs(x = "Dietary compliance", 
+       y = "Pre-diet microbiota plasticity", 
+       color = "Gender") +
+  scale_linetype_manual(values = c(2, 1)) +
+  scale_color_manual(values = gender_cols) + 
+  scale_fill_manual(values = gender_cols) + 
+  theme(legend.position = "top", text = element_text(size = 20))
+```
+
+```{r  adherence-plasticity-bl-tip_glom_SI_long, fig.height=12, fig.width=6}
+ggplot(beta_diver_df_bySubj %>% 
+         filter(
+           VarCat == "BL v. 10wk"),
+       aes(y = dist, x = adherence.changeFromBL, 
+           group = Gender, color= Gender, fill = Gender, 
+           lty = Gender)) +
+  geom_smooth(method = "lm", lwd = 1.5, alpha = 0.25) +
+  geom_point(size = 3, color = "grey50", pch = 21) + 
+  ggpubr::stat_cor(method = "spearman") + 
+  facet_grid(metric ~ Diet, scales = "free") +
+  scale_linetype_manual(values = c(2, 1)) +
+  scale_color_manual(values = gender_cols) + 
+  scale_fill_manual(values = gender_cols) + 
+  theme(legend.position = "top", text = element_text(size = 20))  +
+  labs(x = "Dietary compliance",
+       y = "Microbiota plasticity between pre-diet and 10-weeks", 
+       color = "Gender")
+```
+
+
+```{r}
+sessionInfo()
+```

@@ -1,0 +1,800 @@
+---
+title: "Generating phyloseq object for Diet Study data"
+author:
+  - name: Lan Huong Nguyen
+    affiliation: Institute for Computational and Mathematical Engineering, Stanford University, CA 94305
+keywords: microbiome, gPCA, PCA, clustering, differential abundance.
+date: "`r BiocStyle::doc_date()`"
+output:
+  #html_notebook:
+  BiocStyle::html_document:
+    df_print: paged
+    toc_float: true
+vignette: >
+  %\VignetteIndexEntry{diet microbiome}
+  %\VignetteEngine{knitr::rmarkdown}
+---
+
+In this notebook we process the outputs for DADA2 amplicon read counting 
+pipeline. We provide the read coverage statistics, filter samples and sequences
+which have zero counts, or do not meet required criteria. 
+We apply decontamination procedure to filter out sequences suspected
+to be contaminants. We also estimate a phylogenetic tree for
+the sequences. All data is then combined into a `phyloseq` object.
+
+
+# System setup
+
+```{r setup, include=FALSE}
+rm(list = ls())
+knitr::opts_chunk$set(
+  cache = FALSE, warning = FALSE, message = FALSE, 
+  fig.path = "../figs/generate_phyloseq/", #dev='pdf',
+  fig.align = 'center', fig.wide = TRUE, 
+  fig.width = 8, fig.height = 6
+)
+```
+
+```{r}
+library(tidyverse)
+library(phyloseq)
+library(gridExtra)
+theme_set(theme_bw())
+options(stringsAsFactors = FALSE)
+
+path.to.dada2 <- file.path("../dada2_pipeline/output/maxEE_2_2")
+```
+
+# Dada2 Pipeline
+
+The raw data was processed wih DADA2 pipeline with the source code
+and parameters saved in 'dada2_pipeline.R' and 'dada2_params_used.txt'
+files. Additionally, we used Silva reference database to assign taxonomy.
+The reference files used were: 'silva_nr_v128_train_set.fa.gz' and
+'silva_species_assignment_v128.fa.gz' downloaded from this url
+
+## Reads Statistics
+
+```{r}
+track.reads <- read.csv(
+  file.path(path.to.dada2, "track/track_nochim_reads.csv"), 
+  row.names = 1)
+head(track.reads)
+```
+
+```{r}
+total.reads <- colSums(track.reads[, 4:ncol(track.reads)])/10^6
+total.reads 
+percent.kept <- total.reads/total.reads[1]
+percent.kept
+```
+
+```{r}
+sample.name <- gsub("(.*)\\_", "", track.reads$sample.id)
+particip.samples <- !is.na(as.numeric(sample.name))
+unsigned.and.particip <- !is.na(as.numeric(sample.name)) | 
+  grepl("_unsigned", track.reads$sample.id)
+
+study.reads <- sum(track.reads[unsigned.and.particip, 4])/10^6
+study.reads 
+particip.reads <- colSums(track.reads[particip.samples, 4:ncol(track.reads)])/10^6
+percent.particip.reads <- particip.reads/study.reads
+percent.particip.reads
+```
+
+```{r}
+rm(particip.reads, particip.samples, percent.kept, percent.particip.reads, 
+   sample.name, total.reads, study.reads, unsigned.and.particip)
+```
+
+
+## Taxonomy Table
+
+From dada2 pipeline output, we generated a sequence and a taxonomy table.
+
+First, we look at the taxonomic assignment and combine annotations from both
+databases RDP and Silva:
+
+```{r}
+taxtabSilva <- readRDS(
+  file.path(path.to.dada2, "taxonomy/taxonomy_Silva.rds")) %>%
+  as.data.frame() %>%
+  rownames_to_column("Seq")
+taxtabRDP <- readRDS(
+  file.path(path.to.dada2, "taxonomy/taxonomy_RDP.rds")) %>%
+  as.data.frame() %>%
+  rownames_to_column("Seq")
+
+taxtabMultSilva <- readRDS(
+  file.path(path.to.dada2, "taxonomy/dietSpecies_Silva.rds")) %>%
+  as.data.frame() 
+
+taxtabMultRDP <- readRDS(
+  file.path(path.to.dada2, "taxonomy/dietSpecies_RDP.rds")) %>%
+  as.data.frame() 
+
+colnames(taxtabMultSilva) <- colnames(taxtabMultRDP) <- 
+  c("Genus", "Species")
+
+cat("[Silva] number of sequences w/ genera annotation:",
+    sum(!is.na(taxtabSilva$Genus)), "\n")
+cat("[RDP] number of sequences w/ genera annotation:", 
+    sum(!is.na(taxtabRDP$Genus)), "\n")
+cat("[Silva Multiple] number of sequences w/ genera annotation:",
+    sum(!is.na(taxtabMultSilva$Genus)), "\n")
+cat("[RDP Multiple] number of sequences w/ genera annotation:", 
+    sum(!is.na(taxtabMultRDP$Genus)), "\n")
+
+cat("[Silva] number of sequences w/ species annotation:", 
+    sum(!is.na(taxtabSilva$Species)), "\n")
+cat("[RDP] number of sequences w/ species annotation:", 
+    sum(!is.na(taxtabRDP$Species)), "\n")
+
+cat("[Silva Multiple] number of sequences w/ species annotation:", 
+    sum(!is.na(taxtabMultSilva$Species)), "\n")
+cat("[RDP Multiple] number of sequences w/ species annotation:", 
+    sum(!is.na(taxtabMultRDP$Species)), "\n")
+```
+
+Combine Silva and RDP assignements:
+
+
+```{r}
+taxtab <- taxtabSilva
+taxtab <- lapply(1:nrow(taxtab), function(i) {
+  x <- taxtab[i, ]
+  if(is.na(x$Genus) & !is.na(taxtabRDP$Genus)){
+    return(taxtabRDP[i, ])
+  }
+  return(x)
+}) %>%
+ bind_rows()
+
+taxtab <- data.frame(
+  taxtab, 
+  Genus_MultSilva = taxtabMultSilva$Genus,
+  Species_MultSilva = taxtabMultSilva$Species,
+  Genus_MultRDP = taxtabMultRDP$Genus,
+  Species_MultRDP = taxtabMultRDP$Species
+) %>% 
+select(Kingdom:Species_MultRDP, Seq)
+head(taxtab)
+```
+
+
+```{r}
+cat("[Combined] number of sequences w/ genera annotations:", 
+    sum(!is.na(taxtab$Genus)), "\n")
+cat("[Combined] number of sequences w/ species annotations:", 
+    sum(!is.na(taxtab$Species)), "\n")
+```
+
+## Count Table
+
+Now, we read in the sequence count table.
+
+Change the rownames of the sequence table, and save the sequence
+name to sequence mapping in a data-frame.
+
+```{r}
+seqtab <- read.csv(
+  file.path(path.to.dada2, "seqtab_nochim_transpose.csv"), 
+  row.names = 1)
+dim(seqtab)
+```
+
+```{r}
+colnames(seqtab)[ colSums(seqtab) == 0]
+```
+
+
+```{r}
+seqtab <- seqtab[, colSums(seqtab) > 0]
+dim(seqtab)
+```
+
+Then, we change the rownames so that they are not the long sequences but short
+names. We keep the sequences in the taxonomic table.
+
+```{r}
+all(rownames(seqtab) == taxtab$Seq)
+rownames(seqtab) <- rownames(taxtab) <- paste0("Seq", 1:nrow(seqtab))
+```
+
+
+# Sample Information
+
+Now, read in the sample data.
+
+```{r}
+sampledata <- read.csv(
+  "../data/sample_data/ParticipantData_usedSamples_23April2018_ages.csv", 
+  row.names = 1, stringsAsFactors = FALSE)
+rownames(sampledata) <- paste0(sampledata$Lane, "_", sampledata$SampleID)
+dim(sampledata)
+```
+
+```{r}
+head(sampledata)
+```
+
+We subset to relevant data columns, and format the data.
+
+We also add an extra column denoting whether the sample came from 
+a participant in the study, the negative control or other unrelevant samples.
+
+```{r}
+sampledata <- sampledata %>% 
+  select(Cohort, SubjectID, SampleID, Lane, Color, 
+         Timepoint, Gender, Age, contains("Weight"), 
+         startDate, SampleDate,  Diet) %>%
+  dplyr::rename(StartDate = startDate) %>%
+  mutate(
+    SubjectID = as.character(SubjectID),
+    SampleID = as.character(SampleID),
+    StartDate = as.Date(StartDate, format = "%Y-%m-%d"),
+    SampleDate = as.Date(SampleDate, format = "%m/%d/%y"),
+    SampleType = ifelse(grepl("H2O", SampleID), 
+                        "NegativeControl",
+                        ifelse(is.na(SubjectID), "Extra", "Participant")),
+    Participant = ifelse(is.na(SubjectID), FALSE, TRUE),
+    NegativeControl = grepl("H2O", SampleID)
+  )
+head(sampledata)
+```
+
+We now check and correct the dates.
+
+```{r}
+idx <- which(sampledata$SampleDate < as.Date("2013-01-01", format = "%Y-%m-%d"))
+sampledata[idx, ] %>% select(Cohort:Timepoint, contains("Date"))
+sampledata[idx, "SampleDate"] <- as.Date("2014-05-07", format = "%Y-%m-%d")
+```
+
+
+```{r}
+sampledata[idx, ] %>% select(Cohort:Timepoint, contains("Date"))
+```
+
+
+
+We then process the time point columns. 
+
+```{r}
+sampledata <- sampledata %>%
+  mutate(
+    TimeDiff = SampleDate - StartDate,
+    TimePointComputed  = ifelse(TimeDiff < 40, "Baseline", "10 Week")
+  ) 
+```
+
+
+There are a few (60) samples assigned to "10 Week" which were
+collected a little less than 10 weeks after the start of the diet.
+But since they were still at least 45 days after, we keep them all.
+
+```{r}
+sampledata %>% 
+  filter(TimeDiff > 40, TimeDiff < 70) %>%
+  select(Cohort:Timepoint, contains("Date"), contains("Time")) %>%
+  arrange(TimeDiff)
+```
+
+
+Baseline samples should be taken before the start of the diet.
+The StartDate indicates the day when participants attended their first class
+(at 6-7pm) which was an informational session on the diet they should follow.
+They only started dieting after they attended this class. Therefore, samples
+with the TimeDiff (SampleDate - StartDate) equal to 1 can be still considered
+as fecal content from before the intervention start.
+
+Therefore we consider all the samples with (`TimeDiff` <= 1) as "Baseline" samples, and remove all the "Baseline" samples with (`TimeDiff` > 1).
+
+Below we show which samples (27, 8 from cohort 2) will be removed from the dataset.
+
+
+```{r}
+sampledata %>%
+  filter(TimeDiff > 1, Timepoint == "Baseline") %>%
+  select(Cohort:Color, contains("Time"), contains("Date")) 
+```
+
+```{r}
+idx <- which(sampledata$TimeDiff > 1 & sampledata$Timepoint == "Baseline")
+sampledata <- sampledata[-idx, ] 
+dim(sampledata)
+```
+
+Now we add a few columns of processed information.
+
+First compute the percentage weight loss and assign the success 
+category unsuccessful, moderately and very successful ("US", "MS", "VS") 
+for each timepoint at each the weight was measured.
+
+```{r}
+sampledata <- sampledata %>%
+  mutate(
+    Percent.3Mo = 100 * (Weight_kg.BL - Weight_kg.3Mo)/Weight_kg.BL,
+    Percent.6Mo = 100 * (Weight_kg.BL - Weight_kg.6Mo)/Weight_kg.BL,
+    Percent.12Mo = 100 * (Weight_kg.BL - Weight_kg.12Mo)/Weight_kg.BL,
+    Cat.3Mo = ifelse(Percent.3Mo < 3, "US", ifelse(Percent.3Mo <= 10, "MS", "VS")),
+    Cat.6Mo = ifelse(Percent.6Mo < 3, "US", ifelse(Percent.6Mo <= 10, "MS", "VS")),
+    Cat.12Mo = ifelse(Percent.12Mo < 3, "US", ifelse(Percent.12Mo <= 10, "MS", "VS"))
+  )
+head(sampledata)
+```
+
+
+
+```{r}
+adherence_data <- read.csv(
+  "../data/sample_data/Adherence_selected_IDs_2018-10-26.csv", 
+  stringsAsFactors = FALSE) %>%
+  mutate(
+    old_record_id = as.character(old_record_id),
+    redcap_event_name = gsub("_arm_1", "", redcap_event_name)) 
+head(adherence_data)
+```
+
+```{r}
+adherence_data <- adherence_data %>% 
+  gather(variable, value, -(old_record_id:redcap_event_name)) %>%
+  unite(temp, variable, redcap_event_name) %>%
+  spread(temp, value)
+head(adherence_data)
+```
+
+```{r}
+sampledata <- sampledata %>%
+  left_join(
+    adherence_data %>%
+      mutate(old_record_id = as.character(old_record_id)),
+    by = c("SubjectID" = "old_record_id"))
+```
+
+
+```{r}
+demographics_data <- read.csv(
+  "../data/sample_data/Baseline_race_BMI_2018-11-06.csv", 
+  stringsAsFactors = FALSE) %>%
+  separate(col = race3, into = c("race.prefix", "Race"), sep = "\\.") 
+head(demographics_data)
+```
+
+
+```{r}
+sampledata <- sampledata %>%
+  left_join(
+    demographics_data %>%
+      mutate(old_record_id = as.character(old_record_id)),
+    by = c("SubjectID" = "old_record_id"))
+head(sampledata)
+```
+
+
+```{r}
+sampledata <- sampledata %>%
+  mutate(
+    Diet = gsub("Low-Carb", "Low-carb", Diet),
+    Diet = gsub("Low-Fat", "Low-fat", Diet))
+head(sampledata)
+```
+
+
+# Filtering
+
+Some find the samples from the study participants that were successfully sequences
+(some samples had zero reads after trimming and DADA2 pipleine processing and so 
+do not appear in seqtab).
+
+```{r}
+rownames(sampledata) <- paste0(sampledata$Lane, "_", sampledata$SampleID)
+samples_obtained <- intersect(colnames(seqtab), rownames(sampledata))
+length(samples_obtained)
+```
+
+The samples which are discarded are the 16 samples which were taken too many days
+after the start of the diet to be considered Baseline samples (removed above), 
+and 7 extra "unsigned" (unlabelled).
+
+```{r}
+setdiff(colnames(seqtab), rownames(sampledata))
+```
+
+Samples which were not included in the DADA2 output:
+
+```{r}
+sampledata[setdiff(rownames(sampledata), colnames(seqtab)), ]
+```
+
+```{r}
+sampledata <- sampledata[samples_obtained, ]
+dim(sampledata)
+seqtab <- seqtab[, samples_obtained]
+seqtab <- seqtab[rowSums(seqtab) > 0, ]
+dim(seqtab)
+```
+
+
+First we compute the sample depth of the samples obtained.
+
+```{r, fig.width = 8, fig.height = 5}
+sampledata$OrigSampleDepth <- colSums(seqtab)
+ggplot(data = sampledata %>% arrange(OrigSampleDepth)) +
+  geom_point(
+     aes(x = 1:nrow(sampledata), y = OrigSampleDepth, 
+         color = SampleType, size = Participant) 
+  ) + 
+  scale_color_manual(
+    values = c("Participant" = "grey20",
+               "NegativeControl" = "blue",
+               "Extra" = "Red")) +
+  scale_size_manual(values = c("TRUE" = 1, "FALSE" = 3))
+
+```
+
+```{r}
+summary(colSums(seqtab))
+```
+
+```{r}
+sampledata$SampleID[sampledata$SampleType == "Extra"]
+```
+
+We now discard all the extra samples which are not negative controls or participants in the study.
+
+```{r}
+sampledata <- sampledata %>% filter(SampleType != "Extra")
+rownames(sampledata) <- paste0(sampledata$Lane, "_", sampledata$SampleID)
+dim(sampledata)
+```
+
+```{r}
+seqtab <- seqtab[, rownames(sampledata)]
+seqtab <- seqtab[, colSums(seqtab) > 0]
+dim(seqtab)
+seqtab <- seqtab[rowSums(seqtab) > 0, ]
+dim(seqtab)
+sampledata <- sampledata[colnames(seqtab), ]
+dim(sampledata)
+```
+
+
+
+# Decontamination
+
+In our dataset we have sequence count data for negive control samples
+which contain only the water and the reagents from the extraction 
+kit and no added DNA material. Here we inspect the sequences counts in
+the negative controls to search for contamination. We use 
+[`decontam`](https://github.com/benjjneb/decontam) package find sequences
+which are likely to be contaminants are remove them from our data.
+
+```{r}
+table(sampledata$NegativeControl, sampledata$Lane)
+```
+
+The pools G9 and G10 have mutliple negative controls, and can be treated 
+separately as their own batch. Pools G1-G5 have only one control per samples,
+therefore should not have the test for contaminants performed separately.
+We will thus proceed treating G1-G5 as one bactch and G9, and G10 as two
+additional batches.
+
+```{r}
+batch <- rep("G1-G5", ncol(seqtab))
+batch[sampledata$Lane == "G9"] <- "G9"
+batch[sampledata$Lane == "G10"] <- "G10"
+table(batch)
+```
+
+
+```{r, eval = FALSE}
+library(decontam)
+# Contaminants estimation with no batches, all samples pooled:
+contam.prev <- isContaminant(
+  t(seqtab), 
+  method="prevalence", 
+  neg=sampledata$NegativeControl)
+table(contam.prev)
+# Contaminants estimation with no batches, all samples pooled:
+contam.prev.batch <- isContaminant(
+  t(seqtab), 
+  method="prevalence", 
+  neg=sampledata$NegativeControl, 
+  batch = batch)
+table(contam.prev.batch)
+save(list = c("contam.prev", "contam.prev.batch"), 
+     file = "../data/decontam/decontam_res.rda")
+```
+
+```{r, echo=FALSE}
+load("../data/decontam/decontam_res.rda")
+```
+
+
+```{r}
+# Make presence-absence table in negative controls
+seqtab.neg.presence <- 1*(seqtab[, sampledata$NegativeControl] > 0)
+# Make presence-absence in non-control samples
+seqtab.pos.presence <- 1*(seqtab[, !sampledata$NegativeControl] > 0)
+# Make data.frame of prevalence in positive and negative samples
+df.pres <- data.frame(seq = rownames(seqtab.neg.presence),
+                      prevalence.neg = rowSums(seqtab.neg.presence),
+                      prevalence.pos = rowSums(seqtab.pos.presence),
+                      contam.prev = contam.prev, 
+                      contam.prev.batch = contam.prev.batch)
+plt.contam <- ggplot(aes(x = prevalence.neg, y = prevalence.pos, 
+                         color = contam.prev), data=df.pres) + 
+  geom_text(aes(label = seq))
+plt.contam.batch <- ggplot(aes(x = prevalence.neg, y = prevalence.pos, 
+                         color = contam.prev.batch), data=df.pres) + 
+  geom_text(aes(label = seq)) 
+```
+
+
+```{r}
+plt.contam
+```
+
+```{r}
+plt.contam.batch
+```
+
+```{r, eval = FALSE}
+# Compute prevalence of each feature, store as data.frame
+saveprevdf <- data.frame(
+  row.names = rownames(seqtab),
+  prev.particip = apply(seqtab[, sampledata$Participant], 1,function(x){sum(x > 0)}),
+  prev.neg = apply(seqtab[, sampledata$NegativeControl], 1,function(x){sum(x > 0)}),
+  TotalAbundance = rowSums(seqtab),
+  taxtab[rownames(seqtab), ])
+saveprevdf <- cbind(
+  contam = contam.prev, 
+  contam.batch = contam.prev.batch,
+  saveprevdf)
+saveprevdf <- saveprevdf[saveprevdf$contam | saveprevdf$contam.batch, ]
+write.csv(saveprevdf, "../data/decontam/decontam_res.csv")
+```
+
+We filter out the taxa that were found as contaminants when using both
+batch and pool methods.
+
+```{r}
+remove.seqs <- intersect(rownames(seqtab)[contam.prev], rownames(seqtab)[contam.prev.batch])
+length(remove.seqs)
+seqtab <- seqtab[setdiff(rownames(seqtab), remove.seqs), ]
+taxtab <- taxtab[setdiff(rownames(seqtab), remove.seqs), ]
+dim(seqtab)
+```
+
+```{r}
+rm(df.pres, saveprevdf, seqtab.neg.presence, seqtab.pos.presence,
+   contam.prev, contam.prev.batch, plt.contam, plt.contam.batch)
+```
+
+
+# Construct phylogenetic tree
+
+First we gather the sequences returned by DADA2 which have non-zero total number 
+of reads across all samples of our study participants.
+
+
+```{r}
+write.csv(taxtab, "../data/phyloseq/phylotree/dietStudy_taxtab.csv")
+seqs <- as.character(taxtab$Seq)
+# This propagates to the tip labels of the tree
+names(seqs) <- rownames(seqtab) 
+```
+
+
+```{r echo=FALSE}
+alignment <- readRDS("../data/phyloseq/phylotree/decipher_align.rds")
+load("../data/phyloseq/phylotree/phangorn_fit.rda")
+```
+
+
+These inferred sequence variants are used to construct a phylogenetic tree in a
+de novo fashion. The first step is to perform a multiple-alignment using 
+[DECIPHER](http://decipher.cee.wisc.edu/index.html) R package by Eric 
+Wright (2015).
+
+```{r, eval=FALSE}
+# Run the following on the server:
+library(DECIPHER)
+ptm <- proc.time()
+alignment <- AlignSeqs(DNAStringSet(seqs), anchor= NA, verbose=FALSE)
+(alg.time <- proc.time() - ptm)
+#    user  system elapsed 
+# 327.613   2.897 467.379 
+detach("package:DECIPHER", unload=TRUE)
+saveRDS(alignment, "../data/phyloseq/phylotree/decipher_align.rds")
+```
+
+
+The [phangorn](https://github.com/KlausVigo/phangorn) R package is then used to 
+construct a phylogenetic tree. Here we first construct a neighbor-joining tree, 
+and then fit a GTR+G+I (Generalized time-reversible with Gamma rate variation) 
+maximum likelihood tree initialized at the neighbor-joining tree.
+
+
+```{r, eval=FALSE}
+library(phangorn)
+ptm <- proc.time()
+phang.align <- phyDat(as(alignment, "matrix"), type = "DNA")
+dm <- dist.ml(phang.align)
+# Note, treeNJ tip order != sequence order
+treeNJ <- NJ(dm) 
+fit <- pml(treeNJ, data = phang.align)
+(alg.time <- proc.time() - ptm)
+#    user  system elapsed 
+# 386.928   0.968 388.169 
+ptm <- proc.time()
+fitGTR <- update(fit, k=4, inv=0.2)
+fitGTR <- optim.pml(fitGTR, model="GTR", 
+  optInv = TRUE, optGamma = TRUE, rearrangement = "stochastic") 
+(alg.time <- proc.time() - ptm)
+detach("package:phangorn", unload=TRUE)
+#    user  system elapsed 
+#321.696   0.460 322.185
+# root the tree
+rootedNJtree <- phangorn::midpoint(fit$tree)
+rootedGTRtree <- phangorn::midpoint(fitGTR$tree)
+save(list = c("phang.align", "dm", "treeNJ", "fit", "fitGTR", 
+              "rootedNJtree", "rootedGTRtree"),
+     file = "../data/phyloseq/phylotree/phangorn_fit.rda")
+#      user    system   elapsed
+# 12276.137     7.047 12284.245
+```
+
+We plot the the obtained resulting tree.
+
+```{r}
+#Starting tree
+plt.njtree <- plot_tree(rootedNJtree, method = "treeonly", ladderize = "left") +  ggtitle("NJ tree")
+# Optimized tree
+plt.gtrtree <- plot_tree(rootedGTRtree, method = "treeonly", ladderize = "left") + ggtitle("GTR tree")
+```
+
+```{r fig.height=8, fig.width=8}
+grid.arrange(plt.njtree, plt.gtrtree, nrow = 1)
+```
+
+
+```{r, echo = FALSE}
+# taxtabTest <- read.csv("../data/phyloseq/phylotree/dietStudy_taxtab.csv", row.names = 1)
+# rootedGTRtree$tip.label <- rownames(taxtabTest)
+# rootedGTRtree
+# rm(taxtabTest)
+```
+
+```{r echo=FALSE}
+rm(alignment, fit, dm, numeric.samples, seqs, plt.gtrtree, 
+   phang.align, treeNJ, rootedNJtree)
+```
+
+# Generate a phyloseq object
+
+```{r}
+# ## Collapse sample replicates
+# 
+# There are a few samples which were run more than one time. We will combine
+# them by taking the mean over the two runs:
+# 
+# 
+# # Samples run muptiple times
+# (dup.samples <- sampledata$SampleID[duplicated(sampledata$SampleID)])
+# 
+# sampledata %>% 
+#   select(SubjectID, SampleID, Timepoint, Lane, Color, Gender) %>%
+#   filter(SampleID %in% dup.samples) %>%
+#   arrange(SampleID) 
+# 
+# seqtab1 <- seqtab[, !sampledata$SampleID %in% dup.samples] 
+# seqtab2 <- sapply(dup.samples, function(s) {
+#   rowMeans(seqtab[, sampledata$SampleID == s])})
+# 
+# seqtabcollapse <- cbind(seqtab1, seqtab2)
+# dim(seqtabcollapse)
+# 
+# colnames(seqtabcollapse) <- sub("(.*\\_)(.*?)", "\\2", colnames(seqtabcollapse))
+# dim(seqtabcollapse)
+# 
+# collapse_fields <- function(x){
+#   paste0(unique(x), collapse = " & ")
+# }
+# 
+# sampledatacollapse <- sampledata %>%
+#   group_by(SampleID) %>%
+#   summarize_all(collapse_fields)
+# 
+# rownames(sampledatacollapse) <- sampledatacollapse$SampleID
+# dim(sampledatacollapse)
+# 
+# seqtabcollapse <- seqtabcollapse[, as.character(rownames(sampledatacollapse))]
+# dim(seqtabcollapse)
+```
+
+
+Finally, we use the package [`phyloseq`](https://joey711.github.io/phyloseq/index.html) 
+to combine and store all the data objects we just created.
+
+All samples combined:
+
+```{r}
+sampledata <- data.frame(MeasID = rownames(sampledata), sampledata)
+```
+
+
+```{r}
+tab <- taxtab[, 1:6]
+tab[, 6] <- paste(taxtab$Genus, taxtab$Species)
+orgname <- apply(tab, 1, function(x){
+  x[rev(which(!is.na(x)))[1]]})
+taxtab$OrgName <- paste0(rownames(taxtab), ": ", orgname)
+taxtab <- taxtab %>%
+  select(Kingdom:Species, OrgName, Genus_MultSilva:Species_MultRDP, Seq)
+head(taxtab)
+```
+
+
+```{r}
+ps0 <- phyloseq(otu_table(seqtab, taxa_are_rows = TRUE),
+               sample_data(sampledata),
+               tax_table(as.matrix(taxtab)), 
+               rootedGTRtree)
+ps0
+```
+
+Participants only:
+
+```{r}
+ps <- subset_samples(ps0, Participant == TRUE)
+ps <- subset_taxa(ps, taxa_sums(ps) > 0)
+ps
+```
+
+```{r, eval = TRUE}
+saveRDS(ps0, "../data/phyloseq/diet_all_samples_with_adherence.rds")
+saveRDS(ps, "../data/phyloseq/diet_participants_with_adherence.rds")
+```
+
+
+
+## Update tipglom
+
+```{r, eval = FALSE}
+# h <- 0.1
+# # Tip agglomerated physeq
+# psclust <- clust_tip_glom(ps, h = h)
+# pstips <- merge_tips(ps, psclust)
+# # [ 990 taxa and 494 samples ] # old[ 989 taxa and 491 samples ] 
+# saveRDS(pstips, "../data/phyloseq/diet_participants_tipglom.rds")
+```
+
+
+```{r}
+ps <- readRDS("../data/phyloseq/diet_participants_with_adherence.rds")
+pstips <- readRDS("../data/phyloseq/diet_participants_tipglom.rds")
+pstips
+```
+
+
+```{r}
+dftips <- data.frame(pstips@sam_data) %>% select(-Diet)
+df <- data.frame(ps@sam_data) %>% select(-OrigSampleDepth)
+dftips <- dftips %>%
+  left_join(df)
+rownames(dftips) <- rownames(pstips@sam_data)
+pstips@sam_data <- sample_data(dftips)
+pstips
+saveRDS(pstips, "../data/phyloseq/diet_participants_tipglom_with_adherence.rds")
+```
+
+
+```{r}
+sessionInfo()
+```
+
+
+
+
