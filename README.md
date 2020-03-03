@@ -28,3 +28,5 @@ the sequences. All data is then combined into a `phyloseq` object.
 
 - **differential_abundance_validation_cohort.Rmd** - This notebook contains code for the differnetial abundance analysis for the validation cohort.
 
+- **voom_ihs.R** - This script contains modifications to the \code{voom} command from \code{limma} package by using arcsinh transformations.
+
