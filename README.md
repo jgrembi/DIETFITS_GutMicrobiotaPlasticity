@@ -30,3 +30,5 @@ the sequences. All data is then combined into a `phyloseq` object.
 
 - **voom_ihs.R** - This script contains modifications to the \code{voom} command from \code{limma} package by using arcsinh transformations.
 
+
+https://zenodo.org/badge/DOI/10.5281/zenodo.3763407.svg
