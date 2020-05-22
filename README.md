@@ -1,5 +1,5 @@
 # DIETFITS_GutMicrobiotaPlasticity
-Gut microbiota analysis from the DIETFITS study; found that plasticity (variability) was important for sustained weight loss
+Gut microbiota analysis from the DIETFITS study; found that plasticity (variability) was important for sustained weight loss. Manuscript can be found ![here](https://doi.org/10.1038/s41598-020-58000-y)
 
 This github project contains the analysis files for the DIETFITS gut microbiota study by Grembi, Nguyen, Haggerty, Gardner, Holmes, and Parsonnet.
 
