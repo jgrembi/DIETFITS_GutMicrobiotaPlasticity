@@ -1,5 +1,5 @@
 # DIETFITS_GutMicrobiotaPlasticity
-Gut microbiota analysis from the DIETFITS study; found that plasticity (variability) was important for sustained weight loss. Manuscript can be found [here](https://doi.org/10.1038/s41598-020-58000-y)
+Gut microbiota analysis from the DIETFITS study; found that plasticity (variability) was important for sustained weight loss. The manuscript in Scientific Reports can be found [here](https://doi.org/10.1038/s41598-020-58000-y).
 
 This github project contains the analysis files for the DIETFITS gut microbiota study by Grembi, Nguyen, Haggerty, Gardner, Holmes, and Parsonnet.
 
@@ -30,4 +30,4 @@ the sequences. All data is then combined into a `phyloseq` object.
 
 - **voom_ihs.R** - This script contains modifications to the \code{voom} command from \code{limma} package by using arcsinh transformations.
 
-[DOI](https://zenodo.org/badge/182343382.svg)
+![DOI](https://zenodo.org/badge/182343382.svg)
